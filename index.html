@@ -789,7 +789,8 @@ function parseXML(xmlText, filename) {
   const doc = parser.parseFromString(xmlText, 'text/xml');
   const report = { filename, date:'', sortDate:'', usdRate:1,
     accountNumber:'', clientName:'',
-    assets:[], trades:[], repoTrades:[], futures:[], costs:[], moneyFlows:[] };
+    assets:[], trades:[], repoTrades:[], futures:[], costs:[], moneyFlows:[],
+    marginParams:{ guaranteeStock:0, guaranteeForts:0, limitStock:0, limitForts:0, limitTotal:0 } };
 
   const dateEl = doc.querySelector('reportDate');
   report.date = dateEl ? dateEl.textContent.trim() : '';
@@ -949,6 +950,30 @@ function parseXML(xmlText, filename) {
     });
   });
 
+  // moneyParameters — ГО, лимит средств по рынкам
+  // Структура: тег <moneyParameters> содержит строки без заголовков
+  // строка «Гарантийное обеспечение...» → ячейки [0]=метка,[1]=фондовый,[2]=пусто,[3]=срочный
+  // строка «Лимит средств»              → ячейки [0]=метка,[1]=фондовый,[2]=пусто,[3]=срочный
+  report.marginParams = { guaranteeStock:0, guaranteeForts:0, limitStock:0, limitForts:0, limitTotal:0 };
+  const mpEl = doc.querySelector('moneyParameters');
+  if (mpEl) {
+    const mpRows = [...mpEl.querySelectorAll('row')];
+    mpRows.forEach(row => {
+      const cells = [...row.querySelectorAll('cell')]
+        .map(c => (c.querySelector('cellValue')||{}).textContent||'');
+      const label = cells[0]||'';
+      if (label.includes('Гарантийное обеспечение')) {
+        report.marginParams.guaranteeStock = parseNum(cells[1]);
+        report.marginParams.guaranteeForts = parseNum(cells[3]||cells[2]);
+      } else if (label.trim() === 'Лимит средств') {
+        report.marginParams.limitStock = parseNum(cells[1]);
+        report.marginParams.limitForts = parseNum(cells[3]||cells[2]);
+      } else if (label.includes('Итого лимит')) {
+        report.marginParams.limitTotal = parseNum(cells[1]||cells[3]);
+      }
+    });
+  }
+
   // Money flows (Зачисление/списание денежных средств)
   (parseRows('Зачисление/списание денежных средств')||[]).forEach(r => {
     const op = r['Операция']||'';
@@ -968,7 +993,10 @@ function parseXML(xmlText, filename) {
     else if (opLow.includes('дивиденд') || opLow.includes('купон')) category = 'dividend';
     // Комиссия депозитария
     else if (opLow.includes('комиссия депозитария') || opLow.includes('услуг депозитария')) category = 'depositary';
-    else if (opLow.includes('зачислен')) category = 'deposit';
+    else if (opLow.includes('зачислен')) {
+      // «Перевод» в примечании = внутреннее перемещение между рынками, не пополнение счёта
+      category = noteLow.includes('перевод') ? 'transfer' : 'deposit';
+    }
     else if (opLow.includes('вывод')) category = 'withdrawal';
     else if (opLow.includes('списан')) {
       category = noteLow.includes('перевод') ? 'transfer' : 'withdrawal';
@@ -1108,6 +1136,16 @@ function switchTab(name) {
     panel.style.animation = 'none';
     panel.offsetHeight; // reflow
     panel.style.animation = 'fadeUp 0.4s cubic-bezier(.22,.68,0,1.2) both';
+  }
+  // Hide empty state when on help tab
+  const emptyState = document.getElementById('emptyState');
+  if (emptyState) {
+    if (name === 'help') {
+      emptyState.style.display = 'none';
+    } else {
+      const hasData = DB.reports.length > 0;
+      emptyState.style.display = hasData ? 'none' : 'flex';
+    }
   }
 }
 
@@ -1302,8 +1340,8 @@ function renderAll() {
     chip.remove();
   }
 
-  // Empty state
-  document.getElementById('emptyState').style.display = hasData ? 'none' : 'flex';
+  // Empty state — hide on help tab regardless of data
+  document.getElementById('emptyState').style.display = (hasData || currentTab === 'help') ? 'none' : 'flex';
 
   if (!hasData) {
     // Still restore active tab for help panel (works without data)
@@ -1458,10 +1496,23 @@ function renderOverview() {
   if (!latest) return;
 
   const totalCash = latest.assets.filter(a=>a.name==='RUB').reduce((s,a)=>s+a.valuation,0);
+  const _mp0 = latest.marginParams || {};
+  const cashDisplay = (_mp0.limitStock || 0) + (_mp0.limitForts || 0) || totalCash;
   const stockAssets = latest.assets.filter(a=>a.name!=='RUB'&&(a.valuation!==0||a.planned!==0));
   const totalAbsVal = latest.assets.reduce((s,a)=>s+a.valuation,0);
   const trades = allTrades();
-  const totalFees = trades.reduce((s,t)=>s+t.totalFee,0);
+  // Полная формула — совпадает с renderCosts
+  const _repo      = allRepo();
+  const _exchFee   = trades.reduce((s,t)=>s+Math.abs(t.exchFee),0);
+  const _clearFee  = trades.reduce((s,t)=>s+Math.abs(t.clearFee),0);
+  const _brkStock  = trades.filter(t=>t.type==='stock').reduce((s,t)=>s+Math.abs(t.brokerFee),0);
+  const _brkFut    = trades.filter(t=>t.type==='futures').reduce((s,t)=>s+Math.abs(t.brokerFee),0);
+  const _brkRepo   = _repo.reduce((s,r)=>s+Math.abs(r.brokerFee),0);
+  const _carryRepo = Math.abs(_repo.reduce((s,r)=>s+r.carry,0)); // суммарный carry (совпадает с «Плата за займ» в Переносах)
+  const _mf        = allMoneyFlows();
+  const _otherFees = _mf.filter(f=>f.category==='fee').reduce((s,f)=>s+f.amount,0);
+  const _depFees   = _mf.filter(f=>f.category==='depositary').reduce((s,f)=>s+f.amount,0);
+  const totalFees  = _exchFee+_clearFee+_brkStock+_brkFut+_brkRepo+_carryRepo+_otherFees+_depFees;
 
   const {list:pnlList, noBuyData} = calcPnl();
   const totalPnl = pnlList.reduce((s,x)=>s+x.pnl,0);
@@ -1516,8 +1567,8 @@ function renderOverview() {
       </div>
       <div class="card">
         <div class="card-label">Кэш</div>
-        <div class="card-value td-mono">${fmt(totalCash,0)} <small style="font-size:13px;color:var(--text3)">₽</small></div>
-        <div class="card-sub">${totalAbsVal>0?fmt(totalCash/totalAbsVal*100,1):'0'}% портфеля</div>
+        <div class="card-value td-mono">${fmt(cashDisplay,0)} <small style="font-size:13px;color:var(--text3)">₽</small></div>
+        <div class="card-sub">${totalAbsVal>0?fmt(cashDisplay/totalAbsVal*100,1):'0'}% портфеля</div>
       </div>
       <div class="card">
         <div class="card-label">Позиций</div>
@@ -1583,31 +1634,97 @@ function renderOverview() {
             }).join('')}
         </div>
 
-        <!-- Пончик: состав портфеля -->
+        <!-- Пончик + состав портфеля по рынкам -->
         <div class="block">
-          <div class="block-title">Состав портфеля по бумагам</div>
-          ${donutItems.length===0?'<div style="color:var(--text3);font-size:12px">Нет данных</div>':`
-          <div style="display:flex;align-items:flex-start;gap:20px">
-            <div style="flex-shrink:0;position:relative">
-              ${donutSVG(donutItems,160,36)}
-              <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center">
-                <div style="font-size:11px;color:var(--text3);font-family:var(--mono)">итого</div>
-                <div style="font-size:13px;font-weight:700;font-family:var(--mono);white-space:nowrap">${fmt(donutTotal,0)}</div>
-                <div style="font-size:10px;color:var(--text3)">₽</div>
+          <div class="block-title">Состав портфеля</div>
+          ${(()=>{
+            const mp = latest.marginParams || {};
+
+            // ── Срочный рынок ──
+            // В позициях (ГО заблокировано) + свободный кэш (лимит средств)
+            const fortsInPositions = mp.guaranteeForts || 0;
+            const fortsFree        = mp.limitForts     || 0;
+            const fortsTotal       = fortsInPositions + fortsFree;
+
+            // ── Фондовый рынок ──
+            // Акции/облигации по оценке + свободный кэш (лимит средств фондового)
+            const stockAssetsVal = stockAssets
+              .filter(a => (a.market||'').toLowerCase().includes('фондов') || !(a.market||'').toLowerCase().includes('срочн'))
+              .reduce((s,a)=>s+Math.abs(a.valuation),0);
+            const stockFree = mp.limitStock || 0;
+
+            // ── Кэш RUB (не привязанный к рынку) ──
+            // totalCash уже посчитан выше как сумма RUB-активов
+            // Если limitTotal известен — используем его как итог всего портфеля
+            const portfolioTotal = mp.limitTotal > 0
+              ? mp.limitTotal
+              : totalAbsVal;
+
+            // Строим строки разбивки
+            const rows = [];
+
+            // Фондовый рынок: бумаги
+            if (stockAssetsVal > 0) {
+              rows.push({ label:'Бумаги (фондовый рынок)', value: stockAssetsVal,
+                color:'#4f8ef7', note: `${longs.length} позиц.` });
+            }
+            // Фондовый рынок: свободный кэш
+            if (stockFree > 0) {
+              rows.push({ label:'Свободный кэш (фондовый)', value: stockFree,
+                color:'#555b6e', note:'лимит средств' });
+            }
+            // Срочный рынок: в позициях (ГО)
+            if (fortsInPositions > 0) {
+              rows.push({ label:'В позициях (срочный рынок)', value: fortsInPositions,
+                color:'#a78bfa', note:'ГО заблокировано' });
+            }
+            // Срочный рынок: свободный кэш
+            if (fortsFree > 0) {
+              rows.push({ label:'Свободный кэш (срочный)', value: fortsFree,
+                color:'#7c3aed', note:'лимит средств' });
+            }
+            // Если нет данных moneyParameters — fallback на обычный кэш
+            if (rows.length === 0) {
+              if (totalCash > 0) rows.push({ label:'Кэш', value: totalCash, color:'#555b6e', note:'' });
+              longs.slice(0,6).forEach((a,i)=>rows.push({
+                label:a.name, value:a.valuation,
+                color:LONG_COLORS[i%LONG_COLORS.length], note:'' }));
+            }
+
+            const grandTotal = rows.reduce((s,r)=>s+r.value, 0) || portfolioTotal || 1;
+
+            const donutRows = rows.map(r=>({label:r.label, value:r.value, color:r.color}));
+            const donutSvg = donutSVG(donutRows, 160, 36);
+
+            return `
+            <div style="margin-bottom:12px;padding:12px 14px;background:var(--bg3);border-radius:var(--radius-sm);border:1px solid var(--border3)">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+                <span style="font-size:11px;color:var(--text3);font-family:var(--mono);text-transform:uppercase;letter-spacing:.07em">Всего портфель</span>
+                <span style="font-size:18px;font-weight:700;font-family:var(--mono);color:var(--gold2)">${fmt(grandTotal,0)} ₽</span>
               </div>
             </div>
-            <div style="flex:1;min-width:0">
-              ${donutItems.map(item=>{
-                const pct=donutTotal>0?item.value/donutTotal*100:0;
-                return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
-                  <div style="width:8px;height:8px;border-radius:2px;background:${item.color};flex-shrink:0"></div>
-                  <div style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)" title="${item.label}">${short(item.label,14)}${item.isShort?' <span style="font-size:9px;color:var(--red);font-family:var(--mono)">шорт</span>':''}</div>
-                  <div style="font-size:11px;font-family:var(--mono);color:var(--text3);white-space:nowrap">${item.isShort?'−':''}${fmt(pct,1)}%</div>
-                  <div style="font-size:11px;font-family:var(--mono);color:${item.isShort?'var(--red)':'var(--text3)'};white-space:nowrap;min-width:70px;text-align:right">${item.isShort?'−':''}${fmt(item.value,0)} ₽</div>
-                </div>`;
-              }).join('')}
-            </div>
-          </div>`}
+            <div style="display:flex;align-items:flex-start;gap:16px">
+              <div style="flex-shrink:0;position:relative">
+                ${donutSvg}
+                <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;pointer-events:none">
+                  <div style="font-size:9px;color:var(--text3);font-family:var(--mono)">итого</div>
+                  <div style="font-size:12px;font-weight:700;font-family:var(--mono);white-space:nowrap">${fmt(grandTotal,0)}</div>
+                  <div style="font-size:9px;color:var(--text3)">₽</div>
+                </div>
+              </div>
+              <div style="flex:1;min-width:0">
+                ${rows.map(row=>{
+                  const pct = grandTotal > 0 ? row.value/grandTotal*100 : 0;
+                  return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:7px">
+                    <div style="width:8px;height:8px;border-radius:2px;background:${row.color};flex-shrink:0"></div>
+                    <div style="font-size:11px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)" title="${row.label}">${row.label}${row.note?`<span style="font-size:9px;color:var(--text3);margin-left:4px">${row.note}</span>`:''}</div>
+                    <div style="font-size:11px;font-family:var(--mono);color:var(--text3);white-space:nowrap;min-width:34px;text-align:right">${fmt(pct,1)}%</div>
+                    <div style="font-size:11px;font-family:var(--mono);color:var(--text);white-space:nowrap;min-width:80px;text-align:right">${fmt(row.value,0)} ₽</div>
+                  </div>`;
+                }).join('')}
+              </div>
+            </div>`;
+          })()}
         </div>
 
         ${(()=>{
@@ -1948,7 +2065,10 @@ function renderRepo() {
   const totalCarry   = repo.reduce((s,r)=>s+r.carry, 0);
   const totalBroker  = repo.reduce((s,r)=>s+r.brokerFee, 0);
   const totalCost    = repo.reduce((s,r)=>s+r.totalCost, 0);
-  const avgRate      = repo.reduce((s,r)=>s+r.rate,0) / repo.length;
+  const longRepo     = repo.filter(r => r.isLong);
+  const shortRepo    = repo.filter(r => !r.isLong);
+  const avgRateLong  = longRepo.length  ? longRepo.reduce((s,r)=>s+r.rate,0)  / longRepo.length  : null;
+  const avgRateShort = shortRepo.length ? shortRepo.reduce((s,r)=>s+r.rate,0) / shortRepo.length : null;
 
   // По инструментам
   const byEmitter = {};
@@ -1986,10 +2106,16 @@ function renderRepo() {
         <div class="card-label">Итого затраты</div>
         <div class="card-value td-mono neg">${fmt(totalCost,2)} ₽</div>
       </div>
-      <div class="card">
+      ${avgRateLong !== null ? `<div class="card">
         <div class="card-label">Ср. ставка РЕПО</div>
-        <div class="card-value td-mono">${fmt(avgRate,2)}%</div>
-      </div>
+        <div class="card-value td-mono">${fmt(avgRateLong,2)}%</div>
+        <div class="card-sub"><span class="badge badge-long">лонг</span></div>
+      </div>` : ''}
+      ${avgRateShort !== null ? `<div class="card">
+        <div class="card-label">Ср. ставка РЕПО</div>
+        <div class="card-value td-mono">${fmt(avgRateShort,2)}%</div>
+        <div class="card-sub"><span class="badge badge-short">шорт</span></div>
+      </div>` : ''}
     </div>
 
     <div class="section-title">Затраты по инструментам</div>
@@ -2062,7 +2188,7 @@ function renderCosts() {
   const brokerStock = trades.filter(t=>t.type==='stock').reduce((s,t)=>s+Math.abs(t.brokerFee),0);
   const brokerFut   = trades.filter(t=>t.type==='futures').reduce((s,t)=>s+Math.abs(t.brokerFee),0);
   const brokerRepo  = repo.reduce((s,r)=>s+Math.abs(r.brokerFee),0);
-  const carryRepo   = repo.reduce((s,r)=>s+Math.abs(r.carry),0);
+  const carryRepo   = Math.abs(repo.reduce((s,r)=>s+r.carry,0)); // суммарный carry (совпадает с «Плата за займ» в Переносах)
   const otherFees   = allMoneyFlows().filter(f=>f.category==='fee');
   const otherFeeSum = otherFees.reduce((s,f)=>s+f.amount,0);
   const depositaryFees = allMoneyFlows().filter(f=>f.category==='depositary');
@@ -2165,7 +2291,7 @@ function renderCosts() {
         const e=rt.reduce((s,t)=>s+Math.abs(t.exchFee),0);
         const c=rt.reduce((s,t)=>s+Math.abs(t.clearFee),0);
         const b=rt.reduce((s,t)=>s+Math.abs(t.brokerFee),0)+rr.reduce((s,r)=>s+Math.abs(r.brokerFee),0);
-        const cr=rr.reduce((s,r)=>s+Math.abs(r.carry),0);
+        const cr=Math.abs(rr.reduce((s,r)=>s+r.carry,0));
         const dep=r.moneyFlows.filter(f=>f.category==='depositary').reduce((s,f)=>s+f.amount,0);
         const of=r.moneyFlows.filter(f=>f.category==='fee').reduce((s,f)=>s+f.amount,0);
         return `<tr>
