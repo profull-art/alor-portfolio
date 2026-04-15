@@ -867,6 +867,14 @@ function normDate(d) {
   return d;
 }
 
+// Прибавить один календарный день к ISO-дате "YYYY-MM-DD"
+function addOneDay(isoDate) {
+  if (!isoDate) return isoDate;
+  const d = new Date(isoDate + 'T00:00:00');
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
 function fmt(n, d=2) {
   return n.toLocaleString('ru-RU', { minimumFractionDigits:d, maximumFractionDigits:d });
 }
@@ -1012,7 +1020,7 @@ function parseXML(xmlText, filename) {
     const tradeDateRaw = rawDT.includes(' ') ? rawDT.split(' ')[0] : '';
     const tradeSortDate = tradeDateRaw ? normDate(tradeDateRaw) : report.sortDate;
     report.trades.push({
-      date:report.date, sortDate:tradeSortDate,
+      date:tradeDateRaw || report.date, sortDate:tradeSortDate,
       time:timeOnly, emitter:contract,
       operation:r['Операция']||'',
       qty, price, sum:0,
@@ -1335,10 +1343,11 @@ const allTradesUnfiltered = () => {
       all.push(t);
     }
   }
+  function normTime(t) { return t ? t.replace(/^(\d):/, '0$1:') : ''; }
   return all.sort((a,b) => {
     const dc = a.sortDate.localeCompare(b.sortDate);
     if (dc !== 0) return dc;
-    return (a.time||'').localeCompare(b.time||'');
+    return normTime(a.time).localeCompare(normTime(b.time));
   });
 };
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2239,14 +2248,14 @@ function renderOverview() {
 
             <div style="margin-bottom:16px">
               <div style="display:flex;justify-content:space-between;font-size:12px;font-family:var(--mono);margin-bottom:5px">
-                <span style="color:${verdictColor};font-weight:700">${fmt(qs.totalVol,0)} ₽</span>
+                <span style="color:${qs.condVol?'var(--green)':verdictColor};font-weight:700">${fmt(qs.totalVol,0)} ₽</span>
                 <span style="color:var(--text3)">цель 6 000 000 ₽</span>
               </div>
               <div style="height:10px;background:var(--bg5);border-radius:5px;overflow:hidden">
-                <div style="width:${pct.toFixed(1)}%;height:100%;background:${qs.allMet?'var(--green)':'var(--red)'};border-radius:5px"></div>
+                <div style="width:${pct.toFixed(1)}%;height:100%;background:${qs.condVol?'var(--green)':'var(--red)'};border-radius:5px"></div>
               </div>
               <div style="font-size:11px;color:var(--text3);margin-top:4px;font-family:var(--mono)">
-                ${qs.allMet
+                ${qs.condVol
                   ? `превышение +${fmt(qs.totalVol-THRESHOLD_VOL,0)} ₽`
                   : `не хватает ${fmt(lacking,0)} ₽ (${fmt(pct,1)}% от нормы)`}
               </div>
