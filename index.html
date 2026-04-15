@@ -1071,7 +1071,7 @@ const allRepo    = () => {
   }
   return all;
 };
-const allCosts   = () => DB.reports.flatMap(r => r.costs);
+const allCosts   = () => { const latest = getLatest(); return latest ? latest.costs : []; };
 const allMoneyFlows = () => {
   const seen = new Set();
   const all = [];
@@ -1219,6 +1219,98 @@ function renderAll() {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// КВАЛ-ИНВЕСТОР: расчёт соответствия по оборотам (ст. 51.2 ФЗ «О рынке ЦБ»)
+// Критерий оборотного метода: оборот ≥ 6 000 000 ₽ за последние 4 квартала,
+// при условии ≥ 10 сделок в каждом квартале и ≥ 1 сделки в каждом месяце.
+// Анализ ведётся кратно КВАРТАЛАМ.
+// ─────────────────────────────────────────────────────────────────────────────
+function calcQualStatus() {
+  const trades = allTrades();
+  if (!trades.length) return null;
+
+  function tradeVolume(t) {
+    if (t.type === 'stock') return Math.abs(t.sum) || Math.abs(t.qty * t.price);
+    const spec = getSpec(t.emitter);
+    const rub = spec.currency === 'USD'
+      ? t.qty * t.price * spec.pointValue * (t.usdRate || 1)
+      : t.qty * t.price * spec.pointValue;
+    return Math.abs(rub);
+  }
+
+  const byQuarter = {};
+  const byMonth   = {};
+
+  trades.forEach(t => {
+    const [y, mo] = t.sortDate.slice(0, 7).split('-').map(Number);
+    const qKey = `${y}-Q${Math.ceil(mo / 3)}`;
+    const mKey = t.sortDate.slice(0, 7);
+    const vol  = tradeVolume(t);
+    if (!byQuarter[qKey]) byQuarter[qKey] = { vol: 0, count: 0 };
+    byQuarter[qKey].vol   += vol;
+    byQuarter[qKey].count += 1;
+    if (!byMonth[mKey]) byMonth[mKey] = { vol: 0, count: 0 };
+    byMonth[mKey].vol   += vol;
+    byMonth[mKey].count += 1;
+  });
+
+  const allQuarters = Object.keys(byQuarter).sort();
+  const REQUIRED_QUARTERS = 4;
+  const THRESHOLD_VOL     = 6_000_000;
+  const hasEnough = allQuarters.length >= REQUIRED_QUARTERS;
+  const workQuarters = hasEnough
+    ? allQuarters.slice(-REQUIRED_QUARTERS)
+    : allQuarters.slice();
+
+  const quarterDetails = workQuarters.map(qk => {
+    const d = byQuarter[qk];
+    const [y, qn] = qk.split('-Q').map(Number);
+    const startMo = (qn - 1) * 3 + 1;
+    const allQMo  = [startMo, startMo+1, startMo+2]
+      .map(m => `${y}-${String(m).padStart(2,'0')}`);
+    const activeMonths = allQMo.filter(m => byMonth[m] && byMonth[m].count > 0).length;
+    const condCount    = d.count >= 10;
+    const condMonthly  = activeMonths === 3;
+    return {
+      key: qk,
+      label: qk.replace('-Q', ' Q'),
+      vol: d.vol, count: d.count,
+      activeMonths,
+      condCount, condMonthly,
+      ok: condCount && condMonthly
+    };
+  });
+
+  const totalVol      = quarterDetails.reduce((s, q) => s + q.vol, 0);
+  const missingQuarters = Math.max(0, REQUIRED_QUARTERS - allQuarters.length);
+  const condVol       = totalVol >= THRESHOLD_VOL;
+  const condAllQOk    = hasEnough && quarterDetails.every(q => q.ok);
+  const allMet        = hasEnough && condVol && condAllQOk;
+
+  // Вычисляем конкретные недостающие кварталы и месяцы
+  // Берём последний известный квартал и отсчитываем вперёд недостающие
+  const MONTH_RU = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
+  let missingDetails = [];
+  if (!hasEnough && allQuarters.length > 0) {
+    const lastQ = allQuarters[allQuarters.length - 1];
+    const [lastY, lastQn] = lastQ.split('-Q').map(Number);
+    for (let i = 1; i <= missingQuarters; i++) {
+      let qn = lastQn + i;
+      let y  = lastY;
+      while (qn > 4) { qn -= 4; y++; }
+      const startMo = (qn - 1) * 3 + 1;
+      const months  = [startMo, startMo+1, startMo+2].map(m => MONTH_RU[m-1]).join('–');
+      missingDetails.push({ quarter: `${y} Q${qn}`, months, year: y, qn });
+    }
+  }
+
+  return {
+    allQuarters, workQuarters, quarterDetails,
+    totalVol, condVol, condAllQOk, allMet,
+    hasEnough, missingQuarters, missingDetails,
+    byMonth
+  };
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // OVERVIEW
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1458,6 +1550,161 @@ function renderOverview() {
         }).join('')}</tbody>
       </table></div>`}`;
     })()}
+
+    ${(()=>{
+      /* ── БЛОК КВАЛИФИКАЦИИ ── */
+      const qs = calcQualStatus();
+      if (!qs) return '';
+
+      const THRESHOLD_VOL = 6_000_000;
+      const pct     = Math.min(100, qs.totalVol / THRESHOLD_VOL * 100);
+      const lacking = Math.max(0, THRESHOLD_VOL - qs.totalVol);
+
+      // Вердикт
+      let verdictColor, verdictIcon, verdictLabel, verdictBg, verdictNote;
+
+      if (!qs.hasEnough) {
+        // Данных меньше 4 кварталов — однозначно не соответствует
+        verdictColor='var(--red)'; verdictIcon='✗';
+        verdictLabel='Не соответствует — недостаточно данных';
+        verdictBg='transparent';
+        verdictNote='';
+      } else if (qs.allMet) {
+        verdictColor='var(--green)'; verdictIcon='✓';
+        verdictLabel='Соответствует по оборотам';
+        verdictBg='transparent';
+        verdictNote='';
+      } else {
+        // Данных достаточно, но критерии не выполнены
+        const failReasons = [];
+        if (!qs.condVol) failReasons.push(`оборот ${fmt(qs.totalVol,0)} ₽ < 6 000 000 ₽`);
+        const failQ = qs.quarterDetails.filter(q=>!q.ok);
+        if (failQ.length) {
+          failQ.forEach(q=>{
+            const r=[];
+            if(!q.condCount) r.push(`сделок: ${q.count}<10`);
+            if(!q.condMonthly) r.push(`активных месяцев: ${q.activeMonths}/3`);
+            failReasons.push(`${q.label}: ${r.join(', ')}`);
+          });
+        }
+        verdictColor='var(--red)'; verdictIcon='✗';
+        verdictLabel='Не соответствует';
+        verdictBg='transparent';
+        verdictNote=failReasons.join(' · ');
+      }
+
+      function condRow(ok, text, detail, warn) {
+        const c  = ok ? 'var(--green)' : 'var(--red)';
+        const ic = ok ? '✓' : '✗';
+        const warnColor = warn ? 'var(--amber)' : 'var(--text3)';
+        return `<div style="display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <span style="font-size:13px;color:${c};flex-shrink:0;width:16px;text-align:center;margin-top:1px">${ic}</span>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;color:var(--text)">${text}</div>
+            <div style="font-size:11px;color:${warnColor};margin-top:2px;font-family:var(--mono)">${detail}</div>
+          </div>
+        </div>`;
+      }
+
+      // Строки по кварталам
+      const quarterRows = qs.hasEnough ? qs.quarterDetails.map(q => {
+        const ok = q.ok;
+        const r=[];
+        if(!q.condCount) r.push(`сделок ${q.count} < 10`);
+        if(!q.condMonthly) r.push(`активных месяцев ${q.activeMonths}/3`);
+        const detail = ok
+          ? `${fmt(q.vol,0)} ₽ · ${q.count} сделок · все 3 мес. активны`
+          : `${fmt(q.vol,0)} ₽ · ${r.join(', ')}`;
+        return condRow(ok, q.label, detail, false);
+      }).join('') : qs.quarterDetails.map(q => {
+        return condRow(false, q.label + ' <span style="font-size:10px;color:var(--amber)">(неполный период)</span>',
+          `${fmt(q.vol,0)} ₽ · ${q.count} сделок · загружено данных`, true);
+      }).join('');
+
+      const periodLabel = qs.hasEnough
+        ? `${qs.workQuarters[0].replace('-Q',' Q')} — ${qs.workQuarters[qs.workQuarters.length-1].replace('-Q',' Q')}`
+        : `${qs.allQuarters[0].replace('-Q',' Q')} — ${qs.allQuarters[qs.allQuarters.length-1].replace('-Q',' Q')} (неполно)`;
+
+      return `
+      <div class="section-title" style="margin-top:28px">Соответствие требованиям квалифицированного инвестора по оборотам</div>
+      <div class="block" style="background:${verdictBg};border-color:${verdictColor}22">
+
+        <!-- Вердикт -->
+        <div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:20px">
+          <div style="width:44px;height:44px;border-radius:12px;border:1.5px solid ${verdictColor};
+            display:flex;align-items:center;justify-content:center;
+            font-size:20px;color:${verdictColor};flex-shrink:0;margin-top:2px">${verdictIcon}</div>
+          <div style="flex:1">
+            <div style="font-size:16px;font-weight:700;color:${verdictColor};margin-bottom:4px">${verdictLabel}</div>
+            <div style="font-size:12px;color:var(--text3);font-family:var(--mono)">Анализ: ${periodLabel}</div>
+            ${verdictNote?`<div style="font-size:12px;color:var(--amber);margin-top:6px;line-height:1.6">${verdictNote}</div>`:''}
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+
+          <!-- Левая: прогресс оборота + итоговые условия -->
+          <div>
+            <div style="font-size:11px;font-family:var(--mono);text-transform:uppercase;letter-spacing:0.08em;color:var(--text3);margin-bottom:10px">Суммарный оборот за период</div>
+
+            <div style="margin-bottom:16px">
+              <div style="display:flex;justify-content:space-between;font-size:12px;font-family:var(--mono);margin-bottom:5px">
+                <span style="color:${verdictColor};font-weight:700">${fmt(qs.totalVol,0)} ₽</span>
+                <span style="color:var(--text3)">цель 6 000 000 ₽</span>
+              </div>
+              <div style="height:10px;background:var(--bg5);border-radius:5px;overflow:hidden">
+                <div style="width:${pct.toFixed(1)}%;height:100%;background:${qs.allMet?'var(--green)':'var(--red)'};border-radius:5px"></div>
+              </div>
+              <div style="font-size:11px;color:var(--text3);margin-top:4px;font-family:var(--mono)">
+                ${qs.allMet
+                  ? `превышение +${fmt(qs.totalVol-THRESHOLD_VOL,0)} ₽`
+                  : `не хватает ${fmt(lacking,0)} ₽ (${fmt(pct,1)}% от нормы)`}
+              </div>
+            </div>
+
+            <div style="font-size:11px;font-family:var(--mono);text-transform:uppercase;letter-spacing:0.08em;color:var(--text3);margin-bottom:6px">Требования</div>
+            ${condRow(
+              qs.hasEnough && qs.condVol,
+              'Оборот ≥ 6 000 000 ₽ за 4 квартала',
+              qs.hasEnough ? `${fmt(qs.totalVol,0)} ₽` : 'недостаточно данных для расчёта',
+              !qs.hasEnough
+            )}
+            ${condRow(
+              qs.hasEnough && qs.condAllQOk,
+              'Все 4 квартала: ≥10 сделок, 3 актив. мес.',
+              qs.hasEnough
+                ? `${qs.quarterDetails.filter(q=>q.ok).length} из 4 кварталов выполняют оба условия`
+                : `загружено ${qs.allQuarters.length} из 4 необходимых кварталов`,
+              !qs.hasEnough
+            )}
+            <div style="font-size:10px;color:var(--text3);margin-top:8px;padding-top:8px;border-top:1px solid var(--border);line-height:1.6">
+              Расчёт по ст. 51.2 ФЗ «О рынке ценных бумаг» (ред. 2024 г.).<br>
+              Итоговое решение принимает брокер на основе заверенных документов.
+            </div>
+          </div>
+
+          <!-- Правая: детализация по кварталам -->
+          <div>
+            <div style="font-size:11px;font-family:var(--mono);text-transform:uppercase;letter-spacing:0.08em;color:var(--text3);margin-bottom:6px">
+              Детализация по кварталам
+              ${!qs.hasEnough?`<span style="color:var(--amber);text-transform:none;letter-spacing:0;margin-left:6px">загружено ${qs.allQuarters.length}/4</span>`:''}
+            </div>
+            ${quarterRows}
+            ${!qs.hasEnough?`
+            <div class="warn-box" style="margin-top:12px;font-size:12px;line-height:1.8">
+              <div style="font-weight:600;margin-bottom:4px">Для полного анализа не хватает ${qs.missingQuarters} кв.:</div>
+              ${qs.missingDetails.map(d=>`
+              <div style="display:flex;align-items:baseline;gap:8px;padding:2px 0">
+                <span style="font-family:var(--mono);font-weight:700;min-width:60px">${d.quarter}</span>
+                <span style="color:inherit;opacity:0.75">${d.months} ${d.year} г.</span>
+              </div>`).join('')}
+              <div style="margin-top:6px;opacity:0.75;font-size:11px">Загрузите XML-отчёты за указанные периоды и повторите проверку.</div>
+            </div>`:''}
+          </div>
+
+        </div>
+      </div>`;
+    })()}
   `;
 }
 
@@ -1614,7 +1861,7 @@ function renderRepo() {
       <div class="card">
         <div class="card-label">Плата за займ</div>
         <div class="card-value td-mono neg">${fmt(totalCarry,2)} ₽</div>
-        <div class="card-sub">(p2−p1) × qty</div>
+        <div class="card-sub">плата за перенос позиции</div>
       </div>
       <div class="card">
         <div class="card-label">Брокерская</div>
