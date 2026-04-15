@@ -782,11 +782,18 @@ function parseXML(xmlText, filename) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(xmlText, 'text/xml');
   const report = { filename, date:'', sortDate:'', usdRate:1,
+    accountNumber:'', clientName:'',
     assets:[], trades:[], repoTrades:[], futures:[], costs:[], moneyFlows:[] };
 
   const dateEl = doc.querySelector('reportDate');
   report.date = dateEl ? dateEl.textContent.trim() : '';
   report.sortDate = normDate(report.date);
+
+  // Номер договора и имя клиента
+  const contractEl = doc.querySelector('contractNumber');
+  report.accountNumber = contractEl ? contractEl.textContent.trim() : '';
+  const clientEl = doc.querySelector('clientName');
+  report.clientName = clientEl ? clientEl.textContent.trim() : '';
 
   // USD rate from moneyMovements row "Курс ЦБ РФ"
   for (const row of doc.querySelectorAll('moneyMovements row')) {
@@ -948,13 +955,18 @@ function parseXML(xmlText, filename) {
     const opLow = op.toLowerCase();
     const noteLow = note.toLowerCase();
     let category = 'other';
-    if (opLow.includes('зачислен')) category = 'deposit';
+    // Налоги — проверяем ДО «списания», т.к. «Списание налога» должно идти в tax
+    if (opLow.includes('возврат налога')) category = 'tax_return';
+    else if (opLow.includes('налог') || noteLow.includes('налог')) category = 'tax';
+    // Дивиденды / купоны
+    else if (opLow.includes('дивиденд') || opLow.includes('купон')) category = 'dividend';
+    // Комиссия депозитария
+    else if (opLow.includes('комиссия депозитария') || opLow.includes('услуг депозитария')) category = 'depositary';
+    else if (opLow.includes('зачислен')) category = 'deposit';
     else if (opLow.includes('вывод')) category = 'withdrawal';
     else if (opLow.includes('списан')) {
       category = noteLow.includes('перевод') ? 'transfer' : 'withdrawal';
     }
-    else if (opLow.includes('возврат налога')) category = 'tax_return';
-    else if (opLow.includes('налог')) category = 'tax';
     // «Плата за пользование активом» с суммой > 0 — начисление процентов брокером
     else if (opLow.includes('пользование активом') && amount > 0) category = 'income';
     // Любое вознаграждение/комиссия брокера или прочие операции с суммой < 0 — комиссия
@@ -980,16 +992,39 @@ document.getElementById('fileInput').addEventListener('change', e => {
 function loadFiles(files) {
   let pending = files.length;
   if (!pending) return;
+  const newReports = [];
+  const errors = [];
+
   Array.from(files).forEach(file => {
     const reader = new FileReader();
     reader.onload = e => {
       try {
         const r = parseXML(e.target.result, file.name);
-        const idx = DB.reports.findIndex(x => x.filename === file.name);
-        if (idx >= 0) DB.reports[idx] = r; else DB.reports.push(r);
-      } catch(err) { console.error('Parse error', file.name, err); }
+        newReports.push(r);
+      } catch(err) {
+        console.error('Parse error', file.name, err);
+        errors.push(file.name);
+      }
       if (--pending === 0) {
-        // Сортировка по хронологии (полная дата)
+        // Проверка: все новые отчёты должны быть одного счёта
+        const numbersInNew = [...new Set(newReports.map(r => r.accountNumber).filter(Boolean))];
+        if (numbersInNew.length > 1) {
+          showAccountError(`В загруженных файлах найдено несколько счетов: ${numbersInNew.map(n=>`№${n}`).join(', ')}. Загружайте отчёты только одного счёта.`);
+          return;
+        }
+        // Если уже есть загруженные отчёты — проверяем совпадение с ними
+        if (DB.reports.length > 0 && numbersInNew.length > 0) {
+          const existingAccount = DB.reports[0].accountNumber;
+          if (existingAccount && numbersInNew[0] !== existingAccount) {
+            showAccountError(`Счёт №${numbersInNew[0]} не совпадает с уже загруженным счётом №${existingAccount}. Сначала очистите текущие отчёты.`);
+            return;
+          }
+        }
+        // Добавляем/обновляем
+        newReports.forEach(r => {
+          const idx = DB.reports.findIndex(x => x.filename === r.filename);
+          if (idx >= 0) DB.reports[idx] = r; else DB.reports.push(r);
+        });
         DB.reports.sort((a,b) => a.sortDate.localeCompare(b.sortDate));
         renderAll();
       }
@@ -1001,6 +1036,53 @@ function loadFiles(files) {
 function removeFile(name) {
   DB.reports = DB.reports.filter(r => r.filename !== name);
   renderAll();
+}
+
+function clearAll() {
+  DB.reports = [];
+  renderAll();
+}
+
+function showAccountError(msg) {
+  // Показываем модальное сообщение об ошибке счёта
+  let modal = document.getElementById('accountErrorModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'accountErrorModal';
+    modal.style.cssText = `
+      position:fixed;inset:0;z-index:1000;
+      display:flex;align-items:center;justify-content:center;
+      background:rgba(0,0,0,0.55);backdrop-filter:blur(4px);
+    `;
+    modal.innerHTML = `
+      <div style="
+        background:var(--bg2);border:1px solid var(--red2);border-radius:var(--radius);
+        padding:28px 32px;max-width:480px;width:90%;
+        box-shadow:0 16px 48px rgba(0,0,0,0.5);
+        animation:fadeUp 0.3s cubic-bezier(.22,.68,0,1.2) both;
+      ">
+        <div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:20px">
+          <div style="width:40px;height:40px;border-radius:10px;border:1.5px solid var(--red);
+            display:flex;align-items:center;justify-content:center;font-size:20px;color:var(--red);flex-shrink:0">✕</div>
+          <div>
+            <div style="font-size:16px;font-weight:700;color:var(--red);margin-bottom:6px">Ошибка — несовместимые счета</div>
+            <div id="accountErrorMsg" style="font-size:13px;color:var(--text2);line-height:1.6"></div>
+          </div>
+        </div>
+        <button onclick="document.getElementById('accountErrorModal').remove()"
+          style="width:100%;padding:10px;background:var(--bg4);border:1px solid var(--border2);
+          border-radius:var(--radius-sm);color:var(--text);font-family:var(--sans);font-size:14px;
+          font-weight:600;cursor:pointer;transition:all 0.15s;"
+          onmouseover="this.style.borderColor='var(--red)'"
+          onmouseout="this.style.borderColor='var(--border2)'">
+          Понятно
+        </button>
+      </div>`;
+    document.body.appendChild(modal);
+    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+  }
+  document.getElementById('accountErrorMsg').textContent = msg;
+  document.body.appendChild(modal);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1191,9 +1273,28 @@ function calcPopular() {
 // ─────────────────────────────────────────────────────────────────────────────
 function renderAll() {
   const hasData = DB.reports.length > 0;
-
-  // USD rates in header (files bar hidden)
   const latest = getLatest();
+
+  // Обновляем чип счёта в шапке
+  let chip = document.getElementById('accountChip');
+  if (hasData && latest && latest.accountNumber) {
+    if (!chip) {
+      chip = document.createElement('div');
+      chip.id = 'accountChip';
+      chip.style.cssText = 'display:inline-flex;align-items:center;gap:8px;padding:7px 14px;background:var(--bg3);border:1px solid var(--border3);border-radius:var(--radius-sm);font-size:12px;font-family:var(--mono);color:var(--gold);white-space:nowrap;';
+      const rightEl = document.querySelector('.header-right');
+      rightEl.insertBefore(chip, rightEl.firstChild);
+    }
+    chip.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;opacity:0.7"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+      <span>Счёт&nbsp;№${latest.accountNumber}</span>
+      ${latest.clientName ? `<span style="color:var(--text3);font-size:11px">· ${latest.clientName}</span>` : ''}
+      <button onclick="clearAll()" title="Очистить все отчёты"
+        style="margin-left:4px;background:none;border:none;cursor:pointer;color:var(--text3);font-size:14px;line-height:1;padding:0 2px;font-family:sans-serif;transition:color 0.15s;"
+        onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--text3)'">✕</button>`;
+  } else if (chip) {
+    chip.remove();
+  }
 
   // Empty state
   document.getElementById('emptyState').style.display = hasData ? 'none' : 'flex';
@@ -1951,7 +2052,9 @@ function renderCosts() {
   const carryRepo   = repo.reduce((s,r)=>s+Math.abs(r.carry),0);
   const otherFees   = allMoneyFlows().filter(f=>f.category==='fee');
   const otherFeeSum = otherFees.reduce((s,f)=>s+f.amount,0);
-  const total = exchFee+clearFee+brokerStock+brokerFut+brokerRepo+carryRepo+otherFeeSum;
+  const depositaryFees = allMoneyFlows().filter(f=>f.category==='depositary');
+  const depositaryFeeSum = depositaryFees.reduce((s,f)=>s+f.amount,0);
+  const total = exchFee+clearFee+brokerStock+brokerFut+brokerRepo+carryRepo+otherFeeSum+depositaryFeeSum;
 
   const costs = allCosts();
   const costsByType = {};
@@ -1964,6 +2067,7 @@ function renderCosts() {
     ['Брокер (фьючерсы)',   brokerFut,  '#f0a030'],
     ['Брокер (РЕПО)',       brokerRepo, '#2ec4b6'],
     ['Плата за займ (РЕПО)',carryRepo,  '#e05555'],
+    ...(depositaryFeeSum > 0 ? [['Комиссия депозитария', depositaryFeeSum, '#f472b6']] : []),
     ...(otherFeeSum > 0 ? [['Прочие комиссии', otherFeeSum, '#a78bfa']] : []),
   ];
 
@@ -1976,6 +2080,7 @@ function renderCosts() {
       <div class="card"><div class="card-label">Брокер (фьючерсы)</div><div class="card-value td-mono neg">−${fmt(brokerFut)} ₽</div></div>
       <div class="card"><div class="card-label">Брокер (РЕПО)</div><div class="card-value td-mono neg">−${fmt(brokerRepo)} ₽</div></div>
       <div class="card"><div class="card-label">Займ РЕПО</div><div class="card-value td-mono neg">−${fmt(carryRepo)} ₽</div></div>
+      ${depositaryFeeSum > 0 ? `<div class="card"><div class="card-label">Комиссия депозитария</div><div class="card-value td-mono neg">−${fmt(depositaryFeeSum,2)} ₽</div><div class="card-sub">${depositaryFees.length} начислений</div></div>` : ''}
       ${otherFeeSum > 0 ? `<div class="card"><div class="card-label">Прочие комиссии</div><div class="card-value td-mono neg">−${fmt(otherFeeSum)} ₽</div></div>` : ''}
       <div class="card" style="border-color:var(--border2)"><div class="card-label">Итого затрат</div><div class="card-value td-mono neg">−${fmt(total)} ₽</div></div>
     </div>
@@ -2021,10 +2126,26 @@ function renderCosts() {
       </tr>`).join('')}</tbody>
     </table></div>` : ''}
 
+    ${depositaryFees.length > 0 ? `
+    <div class="section-title">Комиссия депозитария — детализация</div>
+    <div class="table-wrap"><table>
+      <thead><tr>
+        <th>Дата</th><th>Операция</th><th>Рынок</th><th>Валюта</th><th>Сумма</th><th>Примечание</th>
+      </tr></thead>
+      <tbody>${depositaryFees.map(f=>`<tr>
+        <td class="td-mono td-muted">${f.date}</td>
+        <td><span class="badge" style="background:rgba(244,114,182,0.12);color:#f472b6;border:1px solid rgba(244,114,182,0.25)">Депозитарий</span></td>
+        <td class="td-muted" style="font-size:11px">${f.market}</td>
+        <td class="td-mono td-muted">${f.currency}</td>
+        <td class="td-mono" style="font-weight:700">−${fmt(f.amount,2)} ${f.currency}</td>
+        <td style="font-size:12px;color:var(--text2)">${f.note||'—'}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>` : ''}
+
     <div class="section-title">По дням</div>
     <div class="table-wrap"><table>
       <thead><tr>
-        <th>Дата</th><th>Бирж. сбор</th><th>Клир. сбор</th><th>Брокер</th><th>Займ РЕПО</th><th>Прочие</th><th>Итого, ₽</th>
+        <th>Дата</th><th>Бирж. сбор</th><th>Клир. сбор</th><th>Брокер</th><th>Займ РЕПО</th><th>Депозитарий</th><th>Прочие</th><th>Итого, ₽</th>
       </tr></thead>
       <tbody>${DB.reports.map(r=>{
         const rt=r.trades, rr=r.repoTrades;
@@ -2032,6 +2153,7 @@ function renderCosts() {
         const c=rt.reduce((s,t)=>s+Math.abs(t.clearFee),0);
         const b=rt.reduce((s,t)=>s+Math.abs(t.brokerFee),0)+rr.reduce((s,r)=>s+Math.abs(r.brokerFee),0);
         const cr=rr.reduce((s,r)=>s+Math.abs(r.carry),0);
+        const dep=r.moneyFlows.filter(f=>f.category==='depositary').reduce((s,f)=>s+f.amount,0);
         const of=r.moneyFlows.filter(f=>f.category==='fee').reduce((s,f)=>s+f.amount,0);
         return `<tr>
           <td class="td-mono">${r.date}</td>
@@ -2039,8 +2161,9 @@ function renderCosts() {
           <td class="td-mono">${fmt(c)}</td>
           <td class="td-mono">${fmt(b)}</td>
           <td class="td-mono">${cr>0?fmt(cr):'—'}</td>
+          <td class="td-mono" style="color:${dep>0?'#f472b6':'var(--text3)'}">${dep>0?fmt(dep,2):'—'}</td>
           <td class="td-mono">${of>0?fmt(of):'—'}</td>
-          <td class="td-mono" style="font-weight:700">${fmt(e+c+b+cr+of)}</td>
+          <td class="td-mono" style="font-weight:700">${fmt(e+c+b+cr+dep+of)}</td>
         </tr>`;
       }).join('')}</tbody>
     </table></div>
@@ -2067,6 +2190,7 @@ function renderMoney() {
   const transfers   = flows.filter(f => f.category === 'transfer');
   const taxes       = flows.filter(f => f.category === 'tax');
   const taxReturns  = flows.filter(f => f.category === 'tax_return');
+  const dividends   = flows.filter(f => f.category === 'dividend');
   const incomes     = flows.filter(f => f.category === 'income');
   const fees        = flows.filter(f => f.category === 'fee');
   const others      = flows.filter(f => f.category === 'other');
@@ -2075,10 +2199,11 @@ function renderMoney() {
   const totalWithdrawal = withdrawals.reduce((s,f) => s + f.amount, 0);
   const totalTax        = taxes.reduce((s,f) => s + f.amount, 0);
   const totalTaxReturn  = taxReturns.reduce((s,f) => s + f.amount, 0);
+  const totalDividends  = dividends.reduce((s,f) => s + f.amount, 0);
   const totalIncome     = incomes.reduce((s,f) => s + f.amount, 0);
   const totalFees       = fees.reduce((s,f) => s + f.amount, 0);
   const netTax          = totalTax - totalTaxReturn;
-  const netFlow         = totalDeposit - totalWithdrawal - netTax + totalIncome;
+  const netFlow         = totalDeposit - totalWithdrawal - netTax + totalIncome + totalDividends;
 
   function catBadge(cat) {
     const map = {
@@ -2087,6 +2212,7 @@ function renderMoney() {
       transfer:   ['badge-repo',    'Перевод'],
       tax:        ['badge-partial', 'Налог'],
       tax_return: ['badge-long',    'Возврат налога'],
+      dividend:   ['badge-usd',     'Дивиденды'],
       income:     ['badge-usd',     'Поступление'],
       fee:        ['badge-fut',     'Комиссия'],
       other:      ['badge-closed',  'Прочее'],
@@ -2096,7 +2222,7 @@ function renderMoney() {
   }
 
   function amountDisplay(f) {
-    const isPositive = f.category === 'deposit' || f.category === 'tax_return' || f.category === 'income';
+    const isPositive = f.category === 'deposit' || f.category === 'tax_return' || f.category === 'income' || f.category === 'dividend';
     const isNegative = f.category === 'withdrawal' || f.category === 'tax' || f.category === 'fee';
     const color = isPositive ? 'var(--green)' : isNegative ? 'var(--red)' : 'var(--text)';
     const sign  = isPositive ? '+' : isNegative ? '−' : '';
@@ -2135,6 +2261,7 @@ function renderMoney() {
     { label: 'Внутренние переводы',   rows: transfers,   sign: '±', color: 'var(--text2)' },
     { label: 'Налоги',               rows: taxes,       sign: '−', color: 'var(--red)'   },
     { label: 'Возвраты налогов',      rows: taxReturns,  sign: '+', color: 'var(--green)' },
+    { label: 'Дивиденды / Купоны',   rows: dividends,   sign: '+', color: 'var(--teal)'  },
     { label: 'Поступления прочие',    rows: incomes,     sign: '+', color: 'var(--teal)'  },
     { label: 'Прочее',               rows: others,      sign: '',  color: 'var(--text3)' },
   ].filter(s => s.rows.length > 0);
@@ -2159,40 +2286,43 @@ function renderMoney() {
         <div class="card-value td-mono ${netTax >= 0 ? 'neg' : 'pos'}">${netTax >= 0 ? '−' : '+'}${fmt(Math.abs(netTax), 0)} <small style="font-size:14px">₽</small></div>
         <div class="card-sub">списано ${fmt(totalTax, 0)} ₽${totalTaxReturn > 0 ? ` · возврат ${fmt(totalTaxReturn, 0)} ₽` : ''}</div>
       </div>
+      ${totalDividends > 0 ? `<div class="card">
+        <div class="card-label">Дивиденды / Купоны</div>
+        <div class="card-value td-mono" style="color:var(--teal)">+${fmt(totalDividends, 2)} <small style="font-size:14px">₽</small></div>
+        <div class="card-sub">${dividends.length} начислений</div>
+      </div>` : ''}
       ${totalIncome > 0 ? `<div class="card">
         <div class="card-label">Поступления прочие</div>
         <div class="card-value td-mono" style="color:var(--teal)">+${fmt(totalIncome, 2)} <small style="font-size:14px">₽</small></div>
         <div class="card-sub">${incomes.length} начислений</div>
       </div>` : ''}
-      ${totalFees > 0 ? `<div class="card">
-        <div class="card-label">Комиссии прочие</div>
-        <div class="card-value td-mono neg">−${fmt(totalFees, 2)} <small style="font-size:14px">₽</small></div>
-        <div class="card-sub">${fees.length} списаний</div>
-      </div>` : ''}
       <div class="card ${netFlow >= 0 ? 'card-gold' : ''}">
         <div class="card-label">Чистый приток</div>
         <div class="card-value td-mono ${netFlow >= 0 ? '' : 'neg'}">${netFlow >= 0 ? '+' : '−'}${fmt(Math.abs(netFlow), 0)} <small style="font-size:14px">₽</small></div>
-        <div class="card-sub">пополнения + поступления − выводы − налоги</div>
+        <div class="card-sub">пополнения + дивиденды + прочие − выводы − налоги</div>
       </div>
     </div>
 
     <!-- Визуальная полоска структуры -->
-    ${(totalDeposit + totalWithdrawal + Math.abs(netTax) + totalIncome) > 0 ? (() => {
-      const total = totalDeposit + totalWithdrawal + Math.abs(netTax) + totalIncome;
+    ${(totalDeposit + totalWithdrawal + Math.abs(netTax) + totalIncome + totalDividends) > 0 ? (() => {
+      const total = totalDeposit + totalWithdrawal + Math.abs(netTax) + totalIncome + totalDividends;
       const pDep  = totalDeposit / total * 100;
+      const pDiv  = totalDividends / total * 100;
       const pInc  = totalIncome  / total * 100;
       const pWith = totalWithdrawal / total * 100;
       const pTax  = Math.abs(netTax) / total * 100;
       return `<div style="margin-bottom:24px">
         <div style="display:flex;height:8px;border-radius:6px;overflow:hidden;gap:2px;margin-bottom:10px">
           ${pDep  > 0 ? `<div style="flex:${pDep};background:var(--green);border-radius:4px;min-width:2px"></div>` : ''}
-          ${pInc  > 0 ? `<div style="flex:${pInc};background:var(--teal);border-radius:4px;min-width:2px"></div>` : ''}
+          ${pDiv  > 0 ? `<div style="flex:${pDiv};background:var(--teal);border-radius:4px;min-width:2px"></div>` : ''}
+          ${pInc  > 0 ? `<div style="flex:${pInc};background:#22d3ee;border-radius:4px;min-width:2px"></div>` : ''}
           ${pWith > 0 ? `<div style="flex:${pWith};background:var(--red);border-radius:4px;min-width:2px"></div>` : ''}
           ${pTax  > 0 ? `<div style="flex:${pTax};background:var(--amber);border-radius:4px;min-width:2px"></div>` : ''}
         </div>
         <div style="display:flex;gap:20px;font-size:12px;color:var(--text3);flex-wrap:wrap">
           ${pDep  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--green);margin-right:5px;vertical-align:middle"></span>Пополнения ${fmt(pDep,1)}%</span>` : ''}
-          ${pInc  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--teal);margin-right:5px;vertical-align:middle"></span>Поступления прочие ${fmt(pInc,1)}%</span>` : ''}
+          ${pDiv  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--teal);margin-right:5px;vertical-align:middle"></span>Дивиденды ${fmt(pDiv,1)}%</span>` : ''}
+          ${pInc  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#22d3ee;margin-right:5px;vertical-align:middle"></span>Поступления прочие ${fmt(pInc,1)}%</span>` : ''}
           ${pWith > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--red);margin-right:5px;vertical-align:middle"></span>Выводы ${fmt(pWith,1)}%</span>` : ''}
           ${pTax  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--amber);margin-right:5px;vertical-align:middle"></span>Налоги ${fmt(pTax,1)}%</span>` : ''}
         </div>
