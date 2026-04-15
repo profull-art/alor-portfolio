@@ -179,6 +179,76 @@ body::before {
 .header-sub { font-size: 11px; color: var(--text3); font-family: var(--mono); letter-spacing: 0.05em; }
 .header-right { display: flex; align-items: center; gap: 10px; }
 
+/* ── PERIOD PICKER ── */
+.period-picker {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text2);
+}
+.period-picker.visible { display: flex; }
+.period-picker-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text3);
+  white-space: nowrap;
+}
+.period-picker input[type="date"] {
+  background: var(--bg4);
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 3px 7px;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s;
+  width: 120px;
+}
+.period-picker input[type="date"]:hover,
+.period-picker input[type="date"]:focus { border-color: var(--gold); }
+.period-picker input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.5);
+  cursor: pointer;
+}
+[data-theme="light"] .period-picker input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: none;
+}
+.period-sep { color: var(--text3); font-size: 11px; }
+.period-reset {
+  background: none;
+  border: none;
+  color: var(--text3);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+  font-family: sans-serif;
+  transition: color 0.15s;
+  display: none;
+}
+.period-reset.visible { display: block; }
+.period-reset:hover { color: var(--amber); }
+.period-active-badge {
+  display: none;
+  font-size: 10px;
+  background: rgba(212,168,67,0.15);
+  color: var(--gold);
+  border: 1px solid var(--border3);
+  border-radius: 10px;
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+.period-active-badge.visible { display: inline-block; }
+
 .upload-btn {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 9px 20px;
@@ -634,6 +704,15 @@ select:hover, select:focus { border-color:var(--gold); box-shadow: 0 0 0 3px rgb
     </div>
   </div>
   <div class="header-right">
+    <!-- Period picker — появляется после загрузки отчётов -->
+    <div class="period-picker" id="periodPicker">
+      <span class="period-picker-label">Период</span>
+      <input type="date" id="periodFrom" title="Начало периода" onchange="applyPeriodFilter()">
+      <span class="period-sep">—</span>
+      <input type="date" id="periodTo" title="Конец периода" onchange="applyPeriodFilter()">
+      <span class="period-active-badge" id="periodBadge">фильтр</span>
+      <button class="period-reset" id="periodReset" title="Сбросить фильтр" onclick="resetPeriodFilter()">✕</button>
+    </div>
     <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="Переключить тему">
       <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
       <span id="themeLabel">Светлая</span>
@@ -751,7 +830,24 @@ function getSpec(contract) {
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
-const DB = { reports: [] };
+const DB = { reports: [], filter: { from: null, to: null } };
+
+// Возвращает отчёты, попадающие в выбранный диапазон (или все, если фильтр не задан)
+function getFilteredReports() {
+  const { from, to } = DB.filter;
+  if (!from && !to) return DB.reports;
+  return DB.reports.filter(r => {
+    if (from && r.sortDate < from) return false;
+    if (to   && r.sortDate > to)   return false;
+    return true;
+  });
+}
+
+// Последний отчёт в отфильтрованном диапазоне
+function getFilteredLatest() {
+  const fr = getFilteredReports();
+  return fr.length ? fr[fr.length - 1] : null;
+}
 
 function parseNum(s) {
   if (!s) return 0;
@@ -1071,6 +1167,7 @@ function loadFiles(files) {
           if (idx >= 0) DB.reports[idx] = r; else DB.reports.push(r);
         });
         DB.reports.sort((a,b) => a.sortDate.localeCompare(b.sortDate));
+        updatePeriodPicker();
         renderAll();
       }
     };
@@ -1080,12 +1177,86 @@ function loadFiles(files) {
 
 function removeFile(name) {
   DB.reports = DB.reports.filter(r => r.filename !== name);
+  // Если фильтр выходит за пределы оставшихся отчётов — сбрасываем
+  if (DB.reports.length > 0) {
+    const dates = DB.reports.map(r => r.sortDate);
+    if (DB.filter.from && DB.filter.from < dates[0]) DB.filter.from = null;
+    if (DB.filter.to   && DB.filter.to   > dates[dates.length-1]) DB.filter.to = null;
+  } else {
+    DB.filter = { from: null, to: null };
+  }
+  updatePeriodPicker();
   renderAll();
 }
 
 function clearAll() {
   DB.reports = [];
+  DB.filter = { from: null, to: null };
+  hidePeriodPicker();
   renderAll();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PERIOD FILTER
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Показывает пикер и устанавливает min/max по загруженным отчётам
+function updatePeriodPicker() {
+  if (DB.reports.length === 0) { hidePeriodPicker(); return; }
+  const dates = DB.reports.map(r => r.sortDate).filter(Boolean);
+  if (!dates.length) return;
+  const minDate = dates[0];
+  const maxDate = dates[dates.length - 1];
+  const fromEl = document.getElementById('periodFrom');
+  const toEl   = document.getElementById('periodTo');
+  fromEl.min = minDate; fromEl.max = maxDate;
+  toEl.min   = minDate; toEl.max   = maxDate;
+  // Если фильтр сброшен — выставляем значения в инпуты как подсказку (но не как фильтр)
+  if (!DB.filter.from) fromEl.value = minDate;
+  if (!DB.filter.to)   toEl.value   = maxDate;
+  document.getElementById('periodPicker').classList.add('visible');
+  refreshPeriodUI();
+}
+
+function hidePeriodPicker() {
+  document.getElementById('periodPicker').classList.remove('visible');
+  document.getElementById('periodFrom').value = '';
+  document.getElementById('periodTo').value   = '';
+}
+
+// Применяет фильтр из инпутов и перерисовывает аналитику
+function applyPeriodFilter() {
+  const fromEl = document.getElementById('periodFrom');
+  const toEl   = document.getElementById('periodTo');
+  const from = fromEl.value || null;
+  const to   = toEl.value   || null;
+
+  // Граничные значения совпадают с полным диапазоном → считаем "без фильтра"
+  const dates   = DB.reports.map(r => r.sortDate).filter(Boolean);
+  const minDate = dates[0]            || null;
+  const maxDate = dates[dates.length - 1] || null;
+  DB.filter.from = (from && from !== minDate) ? from : null;
+  DB.filter.to   = (to   && to   !== maxDate) ? to   : null;
+
+  refreshPeriodUI();
+  renderAll();
+}
+
+function resetPeriodFilter() {
+  DB.filter = { from: null, to: null };
+  // Возвращаем инпуты в полный диапазон
+  const dates = DB.reports.map(r => r.sortDate).filter(Boolean);
+  document.getElementById('periodFrom').value = dates[0]            || '';
+  document.getElementById('periodTo').value   = dates[dates.length - 1] || '';
+  refreshPeriodUI();
+  renderAll();
+}
+
+// Обновляет кнопку-крестик и бейдж «фильтр» в пикере
+function refreshPeriodUI() {
+  const active = !!(DB.filter.from || DB.filter.to);
+  document.getElementById('periodReset').classList.toggle('visible', active);
+  document.getElementById('periodBadge').classList.toggle('visible', active);
 }
 
 function showAccountError(msg) {
@@ -1130,8 +1301,31 @@ function showAccountError(msg) {
   document.body.appendChild(modal);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TAB NAVIGATION
+// Все сделки без учёта фильтра — используется только для расчёта квал. инвестора
+const allTradesUnfiltered = () => {
+  const seenFut   = new Set();
+  const seenStock = new Set();
+  const all = [];
+  for (const r of DB.reports) {
+    for (const t of r.trades) {
+      if (t.type === 'futures') {
+        const key = t.dealNum || `${t.emitter}|${t.sortDate}|${t.time}|${t.operation}|${t.price}|${t.qty}`;
+        if (seenFut.has(key)) continue;
+        seenFut.add(key);
+      } else {
+        const key = t.dealNum || `${t.isin||t.emitter}|${t.sortDate}|${t.price}|${t.qty}|${t.sum}`;
+        if (seenStock.has(key)) continue;
+        seenStock.add(key);
+      }
+      all.push(t);
+    }
+  }
+  return all.sort((a,b) => {
+    const dc = a.sortDate.localeCompare(b.sortDate);
+    if (dc !== 0) return dc;
+    return (a.time||'').localeCompare(b.time||'');
+  });
+};
 // ─────────────────────────────────────────────────────────────────────────────
 let currentTab = 'overview';
 
@@ -1172,7 +1366,7 @@ const allTrades  = () => {
   const seenFut   = new Set();   // ключ: биржевой номер сделки
   const seenStock = new Set();   // ключ: isin|date|price|qty|sum
   const all = [];
-  for (const r of DB.reports) {
+  for (const r of getFilteredReports()) {
     for (const t of r.trades) {
       if (t.type === 'futures') {
         // Если есть dealNum — используем его как абсолютно точный ключ
@@ -1198,7 +1392,7 @@ const allTrades  = () => {
 const allRepo    = () => {
   const seen = new Set();
   const all = [];
-  for (const r of DB.reports) {
+  for (const r of getFilteredReports()) {
     for (const t of r.repoTrades) {
       const key = `${t.emitter}|${t.date}|${t.p1}|${t.p2}|${t.qty}|${t.num}`;
       if (seen.has(key)) continue;
@@ -1208,11 +1402,11 @@ const allRepo    = () => {
   }
   return all;
 };
-const allCosts   = () => { const latest = getLatest(); return latest ? latest.costs : []; };
+const allCosts   = () => { const latest = getFilteredLatest(); return latest ? latest.costs : []; };
 const allMoneyFlows = () => {
   const seen = new Set();
   const all = [];
-  for (const r of DB.reports) {
+  for (const r of getFilteredReports()) {
     for (const f of r.moneyFlows) {
       const key = `${f.date}|${f.operation}|${f.amount}|${f.market}|${f.note}`;
       if (seen.has(key)) continue;
@@ -1222,9 +1416,7 @@ const allMoneyFlows = () => {
   }
   return all.sort((a,b) => b.sortDate.localeCompare(a.sortDate));
 };
-const getLatest  = () => DB.reports.length
-  ? DB.reports[DB.reports.length - 1]
-  : null;
+const getLatest  = () => getFilteredLatest();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PNL CALCULATION (FIFO)
@@ -1238,10 +1430,11 @@ const getLatest  = () => DB.reports.length
 // ─────────────────────────────────────────────────────────────────────────────
 function calcPnl() {
 
-  // Получаем входящие остатки из САМОГО РАННЕГО отчёта
+  // Получаем входящие остатки из САМОГО РАННЕГО отчёта в выбранном периоде
   const inheritedMap = {}; // { emitter: qty } (+ лонг, - шорт)
-  if (DB.reports.length > 0) {
-    const earliest = DB.reports[0]; // отчёты отсортированы по возрастанию даты
+  const filteredReports = getFilteredReports();
+  if (filteredReports.length > 0) {
+    const earliest = filteredReports[0]; // отчёты отсортированы по возрастанию даты
     for (const [name, qty] of Object.entries(earliest.openPositions || {})) {
       if (qty !== 0) inheritedMap[name] = qty;
     }
@@ -1438,11 +1631,12 @@ function calcPopular() {
 // ─────────────────────────────────────────────────────────────────────────────
 function renderAll() {
   const hasData = DB.reports.length > 0;
-  const latest = getLatest();
+  // Чип счёта показываем по последнему загруженному отчёту (не по фильтру)
+  const chipReport = DB.reports.length ? DB.reports[DB.reports.length - 1] : null;
 
   // Обновляем чип счёта в шапке
   let chip = document.getElementById('accountChip');
-  if (hasData && latest && latest.accountNumber) {
+  if (hasData && chipReport && chipReport.accountNumber) {
     if (!chip) {
       chip = document.createElement('div');
       chip.id = 'accountChip';
@@ -1452,8 +1646,8 @@ function renderAll() {
     }
     chip.innerHTML = `
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;opacity:0.7"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
-      <span>Счёт&nbsp;№${latest.accountNumber}</span>
-      ${latest.clientName ? `<span style="color:var(--text3);font-size:11px">· ${latest.clientName}</span>` : ''}
+      <span>Счёт&nbsp;№${chipReport.accountNumber}</span>
+      ${chipReport.clientName ? `<span style="color:var(--text3);font-size:11px">· ${chipReport.clientName}</span>` : ''}
       <button onclick="clearAll()" title="Очистить все отчёты"
         style="margin-left:4px;background:none;border:none;cursor:pointer;color:var(--text3);font-size:14px;line-height:1;padding:0 2px;font-family:sans-serif;transition:color 0.15s;"
         onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--text3)'">✕</button>`;
@@ -1499,7 +1693,7 @@ function renderAll() {
 // Анализ ведётся кратно КВАРТАЛАМ.
 // ─────────────────────────────────────────────────────────────────────────────
 function calcQualStatus() {
-  const trades = allTrades();
+  const trades = allTradesUnfiltered(); // квал-инвестор считается по всем загруженным данным
   if (!trades.length) return null;
 
   function tradeVolume(t) {
@@ -1672,12 +1866,15 @@ function renderOverview() {
 
   document.getElementById('panel-overview').innerHTML = `
     <div class="panel-title">${(()=>{
-      const first = DB.reports[0], last = DB.reports[DB.reports.length-1];
+      const fr = getFilteredReports();
+      const first = fr[0], last = fr[fr.length-1];
       const from = first ? first.date : '';
       const to   = last  ? last.date  : '';
-      return from===to
+      const filterActive = !!(DB.filter.from || DB.filter.to);
+      const label = from===to
         ? `Аналитика брокерского счёта <span>${from}</span>`
         : `Аналитика брокерского счёта <span>с ${from} по ${to}</span>`;
+      return label + (filterActive ? ' <span style="font-size:12px;color:var(--amber);font-family:var(--mono);font-weight:400;margin-left:6px">· фильтр активен</span>' : '');
     })()}</div>
 
     <div class="cards">
