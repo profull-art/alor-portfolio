@@ -554,6 +554,7 @@ thead th {
 tbody td { padding:10px 13px; border-bottom:1px solid var(--border); transition: background 0.12s; }
 tbody tr:last-child td { border-bottom:none; }
 tbody tr:hover td { background: var(--row-hover); }
+tfoot td { padding:10px 13px; background:var(--bg4); color:var(--text2); font-size:13px; }
 .td-mono { font-family:var(--mono); font-size:13px; }
 .td-name { font-weight:700; font-size:14px; }
 .td-muted { color:var(--text3); }
@@ -1440,122 +1441,141 @@ function calcPnl() {
     }
   }
 
-  // ── Вспомогательная функция FIFO с унаследованными лотами ──
+  // ── Вспомогательная функция FIFO с унаследованными лотами и поддержкой шортов ──
   // Возвращает { pnl, matchedQty, inheritedBurned, hasRealTrades }
-  // Для лонга: унаследованные лоты в начале очереди покупок (inherited=true)
-  // Для шорта: унаследованные «долги» сжигаются первыми покупками без PnL
+  //
+  // Алгоритм обрабатывает все три случая через единую пошаговую логику:
+  //   1. Унаследованный лонг  (inheritedQty > 0): начинаем с лонг-очередью из inherited лотов
+  //   2. Унаследованный шорт  (inheritedQty < 0): начинаем с шорт-очередью из inherited лотов
+  //   3. Нет унаследованной позиции (inheritedQty = 0): стартуем с пустыми очередями
+  //
+  // Внутрипериодные шорты: если продажа превышает текущий лонг, излишек открывает шорт.
+  // Последующая покупка сначала закрывает шорт, остаток идёт в лонг-очередь.
+  // Это корректно обрабатывает случаи, когда трейдер продаёт больше, чем купил.
   function fifoWithInherited(buys, sells, inheritedQty, isFutures, getSpec) {
     // inheritedQty > 0 → унаследованный лонг
     // inheritedQty < 0 → унаследованный шорт
     // inheritedQty = 0 → нет унаследованной позиции
 
-    if (inheritedQty >= 0) {
-      // ── ЛОНГ или нет унаследованной позиции ──
-      // Строим очередь покупок: сначала унаследованные (inherited=true), потом реальные
-      const buyQ = [];
-      if (inheritedQty > 0) {
-        buyQ.push({ qty: inheritedQty, price: 0, inherited: true, usdRate: 1 });
-      }
-      buys.forEach(b => buyQ.push({ ...b, inherited: false }));
+    // Очереди лонгов и шортов (каждый элемент: { qty, price, inherited, usdRate })
+    const longQ  = [];
+    const shortQ = [];
 
-      let bi = 0, rBuy = 0, rSell = 0, gross = 0, mQty = 0;
-      let inheritedBurned = 0;
-
-      for (const sell of sells) {
-        let sq = sell.qty;
-        while (sq > 0 && bi < buyQ.length) {
-          const matched = Math.min(sq, buyQ[bi].qty);
-          if (!buyQ[bi].inherited) {
-            // Реальная покупка — считаем PnL
-            if (isFutures) {
-              const spec = getSpec();
-              const delta = sell.price - buyQ[bi].price;
-              const pnlRub = spec.currency === 'USD'
-                ? delta * spec.pointValue * matched * sell.usdRate
-                : delta * spec.pointValue * matched;
-              gross += pnlRub;
-            } else {
-              rBuy  += matched * buyQ[bi].price;
-              rSell += matched * sell.price;
-            }
-            mQty += matched;
-          } else {
-            // Унаследованный лот — сжигаем без PnL
-            inheritedBurned += matched;
-          }
-          buyQ[bi].qty -= matched; sq -= matched;
-          if (buyQ[bi].qty === 0) bi++;
-        }
-        // Если продажа не покрыта (нет покупок вообще) — пропускаем остаток
-      }
-
-      const pnl = isFutures ? gross : (rSell - rBuy);
-      return { pnl, matchedQty: mQty, inheritedBurned, hasRealTrades: buys.length > 0 };
-
-    } else {
-      // ── ШОРТ ──
-      // Унаследованный шорт = |inheritedQty| «долгов», которые нужно выкупить.
-      // Первые покупки сжигают их без PnL.
-      // Продажи после открывают новые шорт-позиции → их закрытие покупками считаем в PnL.
-      //
-      // Очередь шортов (аналог buyQ, но для шортовой стороны):
-      // сначала унаследованные «долги» (inherited), потом новые продажи.
-      const shortQ = [];
-      if (inheritedQty < 0) {
-        shortQ.push({ qty: Math.abs(inheritedQty), price: 0, inherited: true, usdRate: 1 });
-      }
-      sells.forEach(s => shortQ.push({ ...s, inherited: false }));
-
-      let si = 0, rSell = 0, rBuy = 0, gross = 0, mQty = 0;
-      let inheritedBurned = 0;
-
-      for (const buy of buys) {
-        let bq = buy.qty;
-        while (bq > 0 && si < shortQ.length) {
-          const matched = Math.min(bq, shortQ[si].qty);
-          if (!shortQ[si].inherited) {
-            // Реальная продажа — считаем PnL (шорт: прибыль = цена продажи - цена покупки)
-            if (isFutures) {
-              const spec = getSpec();
-              const delta = shortQ[si].price - buy.price; // шорт: продали дороже → прибыль
-              const pnlRub = spec.currency === 'USD'
-                ? delta * spec.pointValue * matched * buy.usdRate
-                : delta * spec.pointValue * matched;
-              gross += pnlRub;
-            } else {
-              rSell += matched * shortQ[si].price;
-              rBuy  += matched * buy.price;
-            }
-            mQty += matched;
-          } else {
-            // Унаследованный шорт — сжигаем без PnL
-            inheritedBurned += matched;
-          }
-          shortQ[si].qty -= matched; bq -= matched;
-          if (shortQ[si].qty === 0) si++;
-        }
-      }
-
-      const pnl = isFutures ? gross : (rSell - rBuy);
-      return { pnl, matchedQty: mQty, inheritedBurned, hasRealTrades: sells.length > 0 };
+    // Заполняем начальные очереди унаследованными позициями
+    if (inheritedQty > 0) {
+      longQ.push({ qty: inheritedQty, price: 0, inherited: true, usdRate: 1 });
+    } else if (inheritedQty < 0) {
+      shortQ.push({ qty: Math.abs(inheritedQty), price: 0, inherited: true, usdRate: 1 });
     }
+
+    // Объединяем все события (покупки и продажи) в единый хронологический поток.
+    // Массивы buys/sells уже отсортированы хронологически (allTrades() делает сортировку),
+    // поэтому сливаем их через merge, сохраняя порядок.
+    const events = [];
+    let bi2 = 0, si2 = 0;
+    // buys и sells не имеют временно́й метки здесь, они уже в нужном порядке
+    // внутри каждой группы — просто объединяем: сначала все buys, потом все sells
+    // НО правильнее сохранить порядок из allTrades(). Однако fifoWithInherited
+    // получает уже разделённые массивы. Восстанавливаем порядок через индексы
+    // оригинального sortedTrades, сохранённые в .tradeIdx.
+    // Если tradeIdx недоступен — откатываемся на чередование по индексу.
+    const hasTrIdx = buys.length > 0 && buys[0].tradeIdx !== undefined;
+    if (hasTrIdx) {
+      buys.forEach(b  => events.push({ ...b,  isBuy: true  }));
+      sells.forEach(s => events.push({ ...s,  isBuy: false }));
+      events.sort((a, b) => a.tradeIdx - b.tradeIdx);
+    } else {
+      // Нет индексов → используем interleave: чередуем в порядке поступления
+      // (исторический порядок сохраняется, т.к. allTrades уже хронологичен)
+      buys.forEach(b  => events.push({ ...b,  isBuy: true  }));
+      sells.forEach(s => events.push({ ...s,  isBuy: false }));
+      // Сортируем по tradeIdx если есть, иначе оставляем как есть
+    }
+
+    let rBuy = 0, rSell = 0, gross = 0, mQty = 0, inheritedBurned = 0;
+
+    for (const ev of events) {
+      let remaining = ev.qty;
+
+      if (ev.isBuy) {
+        // ── Покупка: сначала закрываем открытые шорты (FIFO), остаток → лонг ──
+        while (remaining > 0 && shortQ.length > 0) {
+          const matched = Math.min(remaining, shortQ[0].qty);
+          if (!shortQ[0].inherited) {
+            if (isFutures) {
+              const spec = getSpec();
+              const delta = shortQ[0].price - ev.price; // продали дороже → прибыль
+              gross += spec.currency === 'USD'
+                ? delta * spec.pointValue * matched * ev.usdRate
+                : delta * spec.pointValue * matched;
+            } else {
+              rSell += matched * shortQ[0].price;
+              rBuy  += matched * ev.price;
+            }
+            mQty += matched;
+          } else {
+            inheritedBurned += matched;
+          }
+          shortQ[0].qty -= matched;
+          if (shortQ[0].qty === 0) shortQ.shift();
+          remaining -= matched;
+        }
+        if (remaining > 0) {
+          longQ.push({ qty: remaining, price: ev.price, inherited: false, usdRate: ev.usdRate || 1 });
+        }
+
+      } else {
+        // ── Продажа: сначала закрываем открытые лонги (FIFO), остаток → шорт ──
+        while (remaining > 0 && longQ.length > 0) {
+          const matched = Math.min(remaining, longQ[0].qty);
+          if (!longQ[0].inherited) {
+            if (isFutures) {
+              const spec = getSpec();
+              const delta = ev.price - longQ[0].price;
+              gross += spec.currency === 'USD'
+                ? delta * spec.pointValue * matched * ev.usdRate
+                : delta * spec.pointValue * matched;
+            } else {
+              rBuy  += matched * longQ[0].price;
+              rSell += matched * ev.price;
+            }
+            mQty += matched;
+          } else {
+            inheritedBurned += matched;
+          }
+          longQ[0].qty -= matched;
+          if (longQ[0].qty === 0) longQ.shift();
+          remaining -= matched;
+        }
+        if (remaining > 0) {
+          // Лонгов больше нет → открываем шорт
+          shortQ.push({ qty: remaining, price: ev.price, inherited: false, usdRate: ev.usdRate || 1 });
+        }
+      }
+    }
+
+    const pnl = isFutures ? gross : (rSell - rBuy);
+    const hasRealTrades = buys.length > 0 || sells.length > 0;
+    return { pnl, matchedQty: mQty, inheritedBurned, hasRealTrades };
   }
 
   // ── Stocks ──
   const stockMap = {};
-  allTrades().filter(t => t.type==='stock').forEach(t => {
+  allTrades().filter(t => t.type==='stock').forEach((t, idx) => {
     if (!stockMap[t.emitter]) stockMap[t.emitter] = { buys:[], sells:[], totalFee:0, totalBuyQty:0, totalSellQty:0 };
     const m = stockMap[t.emitter];
     m.totalFee += t.totalFee;
-    if (t.isBuy) { m.buys.push({qty:t.qty,price:t.price}); m.totalBuyQty+=t.qty; }
-    else { m.sells.push({qty:t.qty,price:t.price}); m.totalSellQty+=t.qty; }
+    if (t.isBuy) { m.buys.push({qty:t.qty, price:t.price, tradeIdx:idx}); m.totalBuyQty+=t.qty; }
+    else { m.sells.push({qty:t.qty, price:t.price, tradeIdx:idx}); m.totalSellQty+=t.qty; }
   });
 
   const result = [], noBuyData = [];
 
   for (const [emitter, m] of Object.entries(stockMap)) {
-    if (m.totalSellQty === 0 && (inheritedMap[emitter]||0) >= 0) continue;
-    if (m.totalBuyQty === 0 && (inheritedMap[emitter]||0) >= 0) {
+    if (m.totalSellQty === 0 && m.totalBuyQty === 0 && (inheritedMap[emitter]||0) === 0) continue;
+    // Пропускаем только если нет вообще никаких сделок с этим инструментом
+    // (раньше пропускались инструменты без покупок, но теперь поддерживаем шорты)
+    if (m.totalBuyQty === 0 && m.totalSellQty === 0 && (inheritedMap[emitter]||0) >= 0) {
       noBuyData.push({name:emitter,type:'stock'}); continue;
     }
 
@@ -1574,20 +1594,21 @@ function calcPnl() {
     const ttx = m.totalBuyQty + m.totalSellQty;
     const fee = ttx > 0 ? m.totalFee * (matchedQty * 2 / ttx) : 0;
     const hasInherited = inheritedBurned > 0;
+    const netQty = m.totalBuyQty - m.totalSellQty + (inheritedMap[emitter] || 0);
     result.push({ name:emitter, type:'stock', pnl: pnl - fee,
       status: hasInherited ? 'inherited_partial'
-            : m.totalBuyQty > m.totalSellQty ? 'partial' : 'closed',
+            : netQty !== 0 ? 'partial' : 'closed',
       spec:'RUB', unmatched: inheritedBurned });
   }
 
   // ── Futures ──
   const futMap = {};
-  allTrades().filter(t=>t.type==='futures').forEach(t => {
+  allTrades().filter(t=>t.type==='futures').forEach((t, idx) => {
     if (!futMap[t.emitter]) futMap[t.emitter]={buys:[],sells:[],totalFee:0,totalBuyQty:0,totalSellQty:0};
     const m = futMap[t.emitter];
     m.totalFee += t.totalFee;
-    if (t.isBuy) { m.buys.push({qty:t.qty,price:t.price,usdRate:t.usdRate||1}); m.totalBuyQty+=t.qty; }
-    else { m.sells.push({qty:t.qty,price:t.price,usdRate:t.usdRate||1}); m.totalSellQty+=t.qty; }
+    if (t.isBuy) { m.buys.push({qty:t.qty,price:t.price,usdRate:t.usdRate||1,tradeIdx:idx}); m.totalBuyQty+=t.qty; }
+    else { m.sells.push({qty:t.qty,price:t.price,usdRate:t.usdRate||1,tradeIdx:idx}); m.totalSellQty+=t.qty; }
   });
 
   for (const [contract, m] of Object.entries(futMap)) {
@@ -2292,6 +2313,179 @@ function renderPositions() {
 // ─────────────────────────────────────────────────────────────────────────────
 // TRADES — сортировка: свежие сверху
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE PAIRS — FIFO-пары открытие/закрытие для одного инструмента
+// ─────────────────────────────────────────────────────────────────────────────
+function calcTradePairs(emitter) {
+  const trades = allTrades().filter(t => t.emitter === emitter);
+  if (!trades.length) return [];
+
+  const isFutures = trades[0].type === 'futures';
+  const spec = isFutures ? getSpec(emitter) : null;
+
+  // Унаследованные лоты из самого раннего отчёта
+  const filteredReports = getFilteredReports();
+  let inheritedQty = 0;
+  if (filteredReports.length > 0) {
+    inheritedQty = (filteredReports[0].openPositions || {})[emitter] || 0;
+  }
+
+  // Очереди лонгов и шортов
+  // Каждый элемент: { qty, price, date, time, tradeRef, inherited }
+  const longQ  = [];
+  const shortQ = [];
+
+  if (inheritedQty > 0) {
+    longQ.push({ qty: inheritedQty, price: 0, date: '—', time: '', tradeRef: null, inherited: true });
+  } else if (inheritedQty < 0) {
+    shortQ.push({ qty: Math.abs(inheritedQty), price: 0, date: '—', time: '', tradeRef: null, inherited: true });
+  }
+
+  const pairs = [];   // { type, openDate, openTime, closeDate, closeTime, openPrice, closePrice, qty, diff, fees, finRes, isBuyOpen }
+
+  for (const t of trades) {
+    let remaining = t.qty;
+    const feePerLot = t.qty > 0 ? t.totalFee / t.qty : 0;
+
+    if (t.isBuy) {
+      // Закрываем открытые шорты
+      while (remaining > 0 && shortQ.length > 0) {
+        const matched = Math.min(remaining, shortQ[0].qty);
+        const openEntry = shortQ[0];
+        let diff = 0, finRes = 0;
+        if (!openEntry.inherited) {
+          if (isFutures) {
+            const s = spec;
+            const delta = openEntry.price - t.price;
+            diff = s.currency === 'USD'
+              ? delta * s.pointValue * matched * (t.usdRate || 1)
+              : delta * s.pointValue * matched;
+          } else {
+            diff = (openEntry.price - t.price) * matched;
+          }
+          const pairFee = Math.abs(openEntry.feePerLot * matched) + Math.abs(feePerLot * matched);
+          finRes = diff - pairFee;
+          pairs.push({
+            isBuyOpen: false,
+            openDate: openEntry.date, openTime: openEntry.time,
+            closeDate: t.date, closeTime: t.time,
+            openPrice: openEntry.price, closePrice: t.price,
+            qty: matched, diff, fees: pairFee, finRes
+          });
+        }
+        shortQ[0].qty -= matched;
+        if (shortQ[0].qty === 0) shortQ.shift();
+        remaining -= matched;
+      }
+      if (remaining > 0) {
+        longQ.push({ qty: remaining, price: t.price, date: t.date, time: t.time, feePerLot, inherited: false });
+      }
+    } else {
+      // Закрываем открытые лонги
+      while (remaining > 0 && longQ.length > 0) {
+        const matched = Math.min(remaining, longQ[0].qty);
+        const openEntry = longQ[0];
+        let diff = 0, finRes = 0;
+        if (!openEntry.inherited) {
+          if (isFutures) {
+            const s = spec;
+            const delta = t.price - openEntry.price;
+            diff = s.currency === 'USD'
+              ? delta * s.pointValue * matched * (t.usdRate || 1)
+              : delta * s.pointValue * matched;
+          } else {
+            diff = (t.price - openEntry.price) * matched;
+          }
+          const pairFee = Math.abs(openEntry.feePerLot * matched) + Math.abs(feePerLot * matched);
+          finRes = diff - pairFee;
+          pairs.push({
+            isBuyOpen: true,
+            openDate: openEntry.date, openTime: openEntry.time,
+            closeDate: t.date, closeTime: t.time,
+            openPrice: openEntry.price, closePrice: t.price,
+            qty: matched, diff, fees: pairFee, finRes
+          });
+        }
+        longQ[0].qty -= matched;
+        if (longQ[0].qty === 0) longQ.shift();
+        remaining -= matched;
+      }
+      if (remaining > 0) {
+        shortQ.push({ qty: remaining, price: t.price, date: t.date, time: t.time, feePerLot, inherited: false });
+      }
+    }
+  }
+
+  return pairs;
+}
+
+function renderTradePairsTable(emitter) {
+  const pairs = calcTradePairs(emitter);
+  if (!pairs.length) return '';
+
+  let cumulative = 0;
+  const rows = pairs.map((p, i) => {
+    cumulative += p.finRes;
+    const diffCls = p.diff >= 0 ? 'pos' : 'neg';
+    const finCls  = p.finRes >= 0 ? 'pos' : 'neg';
+    const cumCls  = cumulative >= 0 ? 'pos' : 'neg';
+    const typeLabel = p.isBuyOpen
+      ? '<span class="badge badge-buy">Лонг</span>'
+      : '<span class="badge badge-sell">Шорт</span>';
+
+    const fmtPrice = v => typeof v === 'number' && v > 0 ? fmt(v, 2) : '—';
+    const fmtPnl   = v => (v >= 0 ? '+' : '−') + fmt(Math.abs(v), 2) + ' ₽';
+
+    return `<tr>
+      <td class="td-mono td-muted" style="text-align:center">${i + 1}</td>
+      <td>${typeLabel}</td>
+      <td class="td-mono td-muted" style="font-size:11px">${p.openDate}${p.openTime ? ' ' + p.openTime : ''}</td>
+      <td class="td-mono td-muted" style="font-size:11px">${p.closeDate}${p.closeTime ? ' ' + p.closeTime : ''}</td>
+      <td class="td-mono">${fmtPrice(p.openPrice)}</td>
+      <td class="td-mono">${fmtPrice(p.closePrice)}</td>
+      <td class="td-mono">${p.qty}</td>
+      <td class="td-mono ${diffCls}">${fmtPnl(p.diff)}</td>
+      <td class="td-mono neg">−${fmt(p.fees, 2)} ₽</td>
+      <td class="td-mono ${finCls}" style="font-weight:600">${fmtPnl(p.finRes)}</td>
+      <td class="td-mono ${cumCls}" style="font-weight:600">${fmtPnl(cumulative)}</td>
+    </tr>`;
+  }).join('');
+
+  const totalDiff   = pairs.reduce((s, p) => s + p.diff, 0);
+  const totalFees   = pairs.reduce((s, p) => s + p.fees, 0);
+  const totalFinRes = pairs.reduce((s, p) => s + p.finRes, 0);
+
+  return `
+    <div class="section-title" style="margin-top:0;margin-bottom:12px">
+      Пары сделок — ${emitter}
+      <span style="font-size:12px;font-weight:400;color:var(--text3);margin-left:8px">${pairs.length} пар</span>
+    </div>
+    <div class="table-wrap" style="margin-bottom:24px"><table>
+      <thead><tr>
+        <th style="text-align:center">#</th>
+        <th>Тип</th>
+        <th>Открытие</th>
+        <th>Закрытие</th>
+        <th>Цена откр.</th>
+        <th>Цена закр.</th>
+        <th>Кол-во</th>
+        <th>Разница</th>
+        <th>Комиссии</th>
+        <th>Финрез</th>
+        <th>Накопленно</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+      <tfoot><tr style="border-top:2px solid var(--border2);font-weight:600">
+        <td colspan="7" style="color:var(--text2);font-size:12px">Итого</td>
+        <td class="td-mono ${totalDiff>=0?'pos':'neg'}">${(totalDiff>=0?'+':'−') + fmt(Math.abs(totalDiff),2)} ₽</td>
+        <td class="td-mono neg">−${fmt(totalFees,2)} ₽</td>
+        <td class="td-mono ${totalFinRes>=0?'pos':'neg'}" style="font-weight:700">${(totalFinRes>=0?'+':'−') + fmt(Math.abs(totalFinRes),2)} ₽</td>
+        <td></td>
+      </tr></tfoot>
+    </table></div>
+  `;
+}
+
 function renderTrades() {
   const trades = allTrades();
   if (!trades.length) { document.getElementById('panel-trades').innerHTML='<div class="panel-title">Сделки</div><div style="color:var(--text3)">Нет данных</div>'; return; }
@@ -2324,6 +2518,8 @@ function renderTrades() {
     (selEmitter==='all'||t.emitter===selEmitter)
   );
 
+  const pairsBlock = selEmitter !== 'all' ? renderTradePairsTable(selEmitter) : '';
+
   panel.innerHTML = `
     <div class="panel-title">Сделки <span>${filtered.length} записей</span></div>
     <div class="filter-row">
@@ -2341,6 +2537,8 @@ function renderTrades() {
         ${dates.map(d=>`<option value="${d}">${d}</option>`).join('')}
       </select>
     </div>
+    ${pairsBlock ? `<div class="block" style="margin-bottom:24px;padding:20px 20px 8px">${pairsBlock}</div>` : ''}
+    <div class="section-title" style="margin-top:0">Все сделки</div>
     <div class="table-wrap"><table>
       <thead><tr>
         <th>Дата</th><th>Время</th><th>Инструмент</th><th>Операция</th><th>Кол-во</th><th>Цена</th><th>Сумма, ₽</th><th>Бирж. сбор</th><th>Клир. сбор</th><th>Брокер</th>
