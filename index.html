@@ -790,6 +790,7 @@ function parseXML(xmlText, filename) {
   const report = { filename, date:'', sortDate:'', usdRate:1,
     accountNumber:'', clientName:'',
     assets:[], trades:[], repoTrades:[], futures:[], costs:[], moneyFlows:[],
+    openPositions:{},  // { emitter: qty } — входящие позиции (+ лонг, - шорт)
     marginParams:{ guaranteeStock:0, guaranteeForts:0, limitStock:0, limitForts:0, limitTotal:0 } };
 
   const dateEl = doc.querySelector('reportDate');
@@ -841,14 +842,18 @@ function parseXML(xmlText, filename) {
     if (!name) return;
     const valuation = parseNum(r['Оценка по цене последней сделки плановой позиции, руб']);
     const planned = parseNum(r['Плановая позиция']);
+    const incoming = parseNum(r['Входящий остаток факт']);
     report.assets.push({
       portfolio:r['Портфель']||'', name, market:r['Рынок']||'',
-      incoming:parseNum(r['Входящий остаток факт']),
-      outgoing:parseNum(r['Исходящий остаток факт']),
+      incoming, outgoing:parseNum(r['Исходящий остаток факт']),
       planned, valuation,
       price:parseNum(r['Цена последней сделки, руб**']||r['Цена последней сделки в валюте расчетов']),
       isShort: valuation < 0 || planned < 0
     });
+    // Фиксируем входящий остаток для акций (не RUB) — используется в FIFO как унаследованная позиция
+    if (name !== 'RUB' && incoming !== 0) {
+      report.openPositions[name] = (report.openPositions[name] || 0) + incoming;
+    }
   });
 
   // Blocked
@@ -876,7 +881,8 @@ function parseXML(xmlText, filename) {
       qty, price, sum, exchFee, clearFee, brokerFee,
       totalFee: Math.abs(exchFee)+Math.abs(clearFee)+Math.abs(brokerFee),
       isBuy, market:r['Биржа']||'', type:'stock',
-      isin:(r['Номер гос. регистрации']||'').replace(/[\s\u00a0\u202f\u2009]/g,'').trim()
+      isin:(r['Номер гос. регистрации']||'').replace(/[\s\u00a0\u202f\u2009]/g,'').trim(),
+      dealNum:(r['Номер сделки']||'').replace(/[\s\u00a0\u202f\u2009]/g,'').trim()
     });
   });
 
@@ -942,12 +948,17 @@ function parseXML(xmlText, filename) {
   (parseRows('Открытые позиции срочный рынок')||[]).forEach(r => {
     const contract = r['Контракт']||'';
     if (!contract) return;
+    const incoming = parseNum(r['Вход. остаток']);
     report.futures.push({
       contract, portfolio:r['Портфель']||'',
-      incoming:parseNum(r['Вход. остаток']), outgoing:parseNum(r['Исход. остаток']),
+      incoming, outgoing:parseNum(r['Исход. остаток']),
       price:parseNum(r['Расчетная цена']),
       varMargin:parseNum(r['Вар. маржа/Гарантийный перевод'])
     });
+    // Фиксируем входящий остаток для фьючерсов — используется в FIFO как унаследованная позиция
+    if (incoming !== 0) {
+      report.openPositions[contract] = (report.openPositions[contract] || 0) + incoming;
+    }
   });
 
   // moneyParameters — ГО, лимит средств по рынкам
@@ -1169,8 +1180,8 @@ const allTrades  = () => {
         if (seenFut.has(key)) continue;
         seenFut.add(key);
       } else {
-        // Акции/облигации: нет биржевого номера — дедуплицируем по набору полей
-        const key = `${t.isin||t.emitter}|${t.sortDate}|${t.price}|${t.qty}|${t.sum}`;
+        // Акции/облигации: если есть биржевой номер сделки — используем его, иначе набор полей
+        const key = t.dealNum || `${t.isin||t.emitter}|${t.sortDate}|${t.price}|${t.qty}|${t.sum}`;
         if (seenStock.has(key)) continue;
         seenStock.add(key);
       }
@@ -1218,7 +1229,125 @@ const getLatest  = () => DB.reports.length
 // ─────────────────────────────────────────────────────────────────────────────
 // PNL CALCULATION (FIFO)
 // ─────────────────────────────────────────────────────────────────────────────
+// Логика унаследованных позиций:
+//   Самый ранний отчёт содержит входящие остатки (openPositions).
+//   Эти лоты помечаются inherited=true и сжигаются первыми без учёта в PnL.
+//   Лонг (>0): унаследованные лоты сжигаются первыми продажами.
+//   Шорт (<0): унаследованные «долги» сжигаются первыми покупками.
+//   Как только унаследованные исчерпаны — обычный FIFO с расчётом PnL.
+// ─────────────────────────────────────────────────────────────────────────────
 function calcPnl() {
+
+  // Получаем входящие остатки из САМОГО РАННЕГО отчёта
+  const inheritedMap = {}; // { emitter: qty } (+ лонг, - шорт)
+  if (DB.reports.length > 0) {
+    const earliest = DB.reports[0]; // отчёты отсортированы по возрастанию даты
+    for (const [name, qty] of Object.entries(earliest.openPositions || {})) {
+      if (qty !== 0) inheritedMap[name] = qty;
+    }
+  }
+
+  // ── Вспомогательная функция FIFO с унаследованными лотами ──
+  // Возвращает { pnl, matchedQty, inheritedBurned, hasRealTrades }
+  // Для лонга: унаследованные лоты в начале очереди покупок (inherited=true)
+  // Для шорта: унаследованные «долги» сжигаются первыми покупками без PnL
+  function fifoWithInherited(buys, sells, inheritedQty, isFutures, getSpec) {
+    // inheritedQty > 0 → унаследованный лонг
+    // inheritedQty < 0 → унаследованный шорт
+    // inheritedQty = 0 → нет унаследованной позиции
+
+    if (inheritedQty >= 0) {
+      // ── ЛОНГ или нет унаследованной позиции ──
+      // Строим очередь покупок: сначала унаследованные (inherited=true), потом реальные
+      const buyQ = [];
+      if (inheritedQty > 0) {
+        buyQ.push({ qty: inheritedQty, price: 0, inherited: true, usdRate: 1 });
+      }
+      buys.forEach(b => buyQ.push({ ...b, inherited: false }));
+
+      let bi = 0, rBuy = 0, rSell = 0, gross = 0, mQty = 0;
+      let inheritedBurned = 0;
+
+      for (const sell of sells) {
+        let sq = sell.qty;
+        while (sq > 0 && bi < buyQ.length) {
+          const matched = Math.min(sq, buyQ[bi].qty);
+          if (!buyQ[bi].inherited) {
+            // Реальная покупка — считаем PnL
+            if (isFutures) {
+              const spec = getSpec();
+              const delta = sell.price - buyQ[bi].price;
+              const pnlRub = spec.currency === 'USD'
+                ? delta * spec.pointValue * matched * sell.usdRate
+                : delta * spec.pointValue * matched;
+              gross += pnlRub;
+            } else {
+              rBuy  += matched * buyQ[bi].price;
+              rSell += matched * sell.price;
+            }
+            mQty += matched;
+          } else {
+            // Унаследованный лот — сжигаем без PnL
+            inheritedBurned += matched;
+          }
+          buyQ[bi].qty -= matched; sq -= matched;
+          if (buyQ[bi].qty === 0) bi++;
+        }
+        // Если продажа не покрыта (нет покупок вообще) — пропускаем остаток
+      }
+
+      const pnl = isFutures ? gross : (rSell - rBuy);
+      return { pnl, matchedQty: mQty, inheritedBurned, hasRealTrades: buys.length > 0 };
+
+    } else {
+      // ── ШОРТ ──
+      // Унаследованный шорт = |inheritedQty| «долгов», которые нужно выкупить.
+      // Первые покупки сжигают их без PnL.
+      // Продажи после открывают новые шорт-позиции → их закрытие покупками считаем в PnL.
+      //
+      // Очередь шортов (аналог buyQ, но для шортовой стороны):
+      // сначала унаследованные «долги» (inherited), потом новые продажи.
+      const shortQ = [];
+      if (inheritedQty < 0) {
+        shortQ.push({ qty: Math.abs(inheritedQty), price: 0, inherited: true, usdRate: 1 });
+      }
+      sells.forEach(s => shortQ.push({ ...s, inherited: false }));
+
+      let si = 0, rSell = 0, rBuy = 0, gross = 0, mQty = 0;
+      let inheritedBurned = 0;
+
+      for (const buy of buys) {
+        let bq = buy.qty;
+        while (bq > 0 && si < shortQ.length) {
+          const matched = Math.min(bq, shortQ[si].qty);
+          if (!shortQ[si].inherited) {
+            // Реальная продажа — считаем PnL (шорт: прибыль = цена продажи - цена покупки)
+            if (isFutures) {
+              const spec = getSpec();
+              const delta = shortQ[si].price - buy.price; // шорт: продали дороже → прибыль
+              const pnlRub = spec.currency === 'USD'
+                ? delta * spec.pointValue * matched * buy.usdRate
+                : delta * spec.pointValue * matched;
+              gross += pnlRub;
+            } else {
+              rSell += matched * shortQ[si].price;
+              rBuy  += matched * buy.price;
+            }
+            mQty += matched;
+          } else {
+            // Унаследованный шорт — сжигаем без PnL
+            inheritedBurned += matched;
+          }
+          shortQ[si].qty -= matched; bq -= matched;
+          if (shortQ[si].qty === 0) si++;
+        }
+      }
+
+      const pnl = isFutures ? gross : (rSell - rBuy);
+      return { pnl, matchedQty: mQty, inheritedBurned, hasRealTrades: sells.length > 0 };
+    }
+  }
+
   // ── Stocks ──
   const stockMap = {};
   allTrades().filter(t => t.type==='stock').forEach(t => {
@@ -1232,31 +1361,30 @@ function calcPnl() {
   const result = [], noBuyData = [];
 
   for (const [emitter, m] of Object.entries(stockMap)) {
-    if (m.totalSellQty === 0) continue;
-    if (m.totalBuyQty === 0) { noBuyData.push({name:emitter,type:'stock'}); continue; }
-    const buyQ = m.buys.map(b=>({...b}));
-    let bi=0, rBuy=0, rSell=0, mQty=0, unmatched=0;
-    for (const sell of m.sells) {
-      let sq = sell.qty;
-      while (sq>0 && bi<buyQ.length) {
-        const matched = Math.min(sq, buyQ[bi].qty);
-        rBuy  += matched * buyQ[bi].price;
-        rSell += matched * sell.price;
-        mQty  += matched;
-        buyQ[bi].qty -= matched; sq -= matched;
-        if (buyQ[bi].qty===0) bi++;
-      }
-      unmatched += sq; // продано без известной покупки — пропускаем эту часть
+    if (m.totalSellQty === 0 && (inheritedMap[emitter]||0) >= 0) continue;
+    if (m.totalBuyQty === 0 && (inheritedMap[emitter]||0) >= 0) {
+      noBuyData.push({name:emitter,type:'stock'}); continue;
     }
-    // Считаем PnL только по сматченным сделкам; если ничего не сматчилось — пропускаем
-    if (mQty === 0) { noBuyData.push({name:emitter,type:'stock'}); continue; }
-    const ttx = m.totalBuyQty+m.totalSellQty;
-    const fee = ttx>0 ? m.totalFee*(mQty*2/ttx) : 0;
-    const hasInherited = unmatched > 0;
-    result.push({ name:emitter, type:'stock', pnl:rSell-rBuy-fee,
+
+    const inherited = inheritedMap[emitter] || 0;
+    const { pnl, matchedQty, inheritedBurned, hasRealTrades } =
+      fifoWithInherited(m.buys, m.sells, inherited, false, null);
+
+    if (matchedQty === 0 && inheritedBurned === 0) {
+      noBuyData.push({name:emitter,type:'stock'}); continue;
+    }
+    if (matchedQty === 0) {
+      // Только унаследованные лоты — PnL не считаем, но позиция была
+      continue;
+    }
+
+    const ttx = m.totalBuyQty + m.totalSellQty;
+    const fee = ttx > 0 ? m.totalFee * (matchedQty * 2 / ttx) : 0;
+    const hasInherited = inheritedBurned > 0;
+    result.push({ name:emitter, type:'stock', pnl: pnl - fee,
       status: hasInherited ? 'inherited_partial'
-            : m.totalBuyQty>m.totalSellQty ? 'partial' : 'closed',
-      spec:'RUB', unmatched });
+            : m.totalBuyQty > m.totalSellQty ? 'partial' : 'closed',
+      spec:'RUB', unmatched: inheritedBurned });
   }
 
   // ── Futures ──
@@ -1270,34 +1398,27 @@ function calcPnl() {
   });
 
   for (const [contract, m] of Object.entries(futMap)) {
-    if (m.totalSellQty===0) continue;
-    if (m.totalBuyQty===0) { noBuyData.push({name:contract,type:'futures'}); continue; }
-    const spec = getSpec(contract);
-    const buyQ = m.buys.map(b=>({...b}));
-    let bi=0, gross=0, mQty=0, unmatchedF=0;
-    for (const sell of m.sells) {
-      let sq=sell.qty;
-      while(sq>0&&bi<buyQ.length){
-        const matched=Math.min(sq,buyQ[bi].qty);
-        const delta=sell.price-buyQ[bi].price;
-        const pnlRub = spec.currency==='USD'
-          ? delta*spec.pointValue*matched*sell.usdRate
-          : delta*spec.pointValue*matched;
-        gross+=pnlRub;
-        mQty+=matched;
-        buyQ[bi].qty-=matched; sq-=matched;
-        if(buyQ[bi].qty===0) bi++;
-      }
-      unmatchedF += sq; // продано без известной покупки — пропускаем
+    if (m.totalSellQty===0 && (inheritedMap[contract]||0) >= 0) continue;
+    if (m.totalBuyQty===0 && (inheritedMap[contract]||0) >= 0) {
+      noBuyData.push({name:contract,type:'futures'}); continue;
     }
-    // Считаем только по сматченным; если ничего не сматчилось — пропускаем
-    if (mQty === 0) { noBuyData.push({name:contract,type:'futures'}); continue; }
-    const ttx=m.totalBuyQty+m.totalSellQty;
-    const fee=ttx>0?m.totalFee*(mQty*2/ttx):0;
-    const hasInherited = unmatchedF > 0;
-    result.push({ name:contract, type:'futures', pnl:gross-fee,
-      status: hasInherited ? 'inherited_partial' : m.totalBuyQty>m.totalSellQty?'partial':'closed',
-      spec:spec.currency, unmatched:unmatchedF });
+
+    const inherited = inheritedMap[contract] || 0;
+    const spec = getSpec(contract);
+    const { pnl, matchedQty, inheritedBurned } =
+      fifoWithInherited(m.buys, m.sells, inherited, true, () => spec);
+
+    if (matchedQty === 0 && inheritedBurned === 0) {
+      noBuyData.push({name:contract,type:'futures'}); continue;
+    }
+    if (matchedQty === 0) continue;
+
+    const ttx = m.totalBuyQty + m.totalSellQty;
+    const fee = ttx > 0 ? m.totalFee * (matchedQty * 2 / ttx) : 0;
+    const hasInherited = inheritedBurned > 0;
+    result.push({ name:contract, type:'futures', pnl: pnl - fee,
+      status: hasInherited ? 'inherited_partial' : m.totalBuyQty > m.totalSellQty ? 'partial' : 'closed',
+      spec: spec.currency, unmatched: inheritedBurned });
   }
 
   return { list:result.sort((a,b)=>b.pnl-a.pnl), noBuyData };
@@ -1597,7 +1718,7 @@ function renderOverview() {
           pnlList.map(x=>{
             const pct=Math.abs(x.pnl)/maxAbsPnl*48;
             const typeBadge=x.type==='futures'?'<span class="badge badge-fut">фьюч</span>':
-              x.status==='inherited_partial'?'<span class="badge badge-inherited" title="Часть лотов продана из унаследованной позиции — посчитаны только новые покупки">частично*</span>':
+              x.status==='inherited_partial'?'<span class="badge badge-inherited" title="Входящий остаток из первого отчёта исключён из PnL — считаются только сделки после исчерпания унаследованной позиции">частично*</span>':
               x.status==='partial'?'<span class="badge badge-partial">частично</span>':
               '<span class="badge badge-closed">закрыта</span>';
             const usdBadge=x.spec==='USD'?'<span class="badge badge-usd">USD</span>':'';
@@ -1612,8 +1733,8 @@ function renderOverview() {
               <div class="pnl-val ${posNeg(x.pnl)}">${x.pnl>=0?'+':'−'}${fmt(Math.abs(x.pnl),2)} ₽</div>
             </div>`;
           }).join('')}
-        ${noBuyData.length>0?`<div class="warn-box">Нет ни одной покупки в загруженных отчётах → PnL полностью не рассчитывается: ${noBuyData.map(x=>`<strong>${x.name}</strong>`).join(', ')}. Загрузите более ранние отчёты.<br><span style="font-size:11px;opacity:0.75">* Инструменты с пометкой «частично*» рассчитаны по тем лотам, покупки которых есть в отчётах; лоты из унаследованных позиций исключены.</span></div>`:
-          `<div style="font-size:11px;color:var(--text3);margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">* Инструменты с пометкой «частично*» рассчитаны только по лотам с известными покупками; лоты из позиций, открытых до загруженного периода, исключены из расчёта.</div>`}
+        ${noBuyData.length>0?`<div class="warn-box">Нет данных о сделках в загруженных отчётах → PnL полностью не рассчитывается: ${noBuyData.map(x=>`<strong>${x.name}</strong>`).join(', ')}. Загрузите отчёты с торговыми операциями по этим инструментам.<br><span style="font-size:11px;opacity:0.75">* Инструменты с пометкой «частично*» содержат унаследованные лоты (входящий остаток из первого отчёта) — они исключены из PnL, т.к. цена открытия неизвестна. PnL считается только по сделкам после исчерпания унаследованной позиции.</span></div>`:
+          `<div style="font-size:11px;color:var(--text3);margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">* Инструменты с пометкой «частично*» содержат унаследованные лоты из входящего остатка первого отчёта. Эти лоты исключены из PnL (цена открытия неизвестна); расчёт ведётся только по сделкам после их исчерпания.</div>`}
         <div class="block-note">Акции: FIFO по ценам сделок. Фьючерсы: FIFO, USD-контракты конвертируются по курсу ЦБ на дату продажи.</div>
       </div>
 
@@ -1636,70 +1757,33 @@ function renderOverview() {
 
         <!-- Пончик + состав портфеля по рынкам -->
         <div class="block">
-          <div class="block-title">Состав портфеля</div>
+          <div class="block-title">Состав портфеля на фондовом рынке</div>
           ${(()=>{
             const mp = latest.marginParams || {};
 
-            // ── Срочный рынок ──
-            // В позициях (ГО заблокировано) + свободный кэш (лимит средств)
-            const fortsInPositions = mp.guaranteeForts || 0;
-            const fortsFree        = mp.limitForts     || 0;
-            const fortsTotal       = fortsInPositions + fortsFree;
-
-            // ── Фондовый рынок ──
-            // Акции/облигации по оценке + свободный кэш (лимит средств фондового)
+            // ── Фондовый рынок только ──
             const stockAssetsVal = stockAssets
               .filter(a => (a.market||'').toLowerCase().includes('фондов') || !(a.market||'').toLowerCase().includes('срочн'))
               .reduce((s,a)=>s+Math.abs(a.valuation),0);
             const stockFree = mp.limitStock || 0;
+            const grandTotal = (stockAssetsVal + stockFree) || 1;
 
-            // ── Кэш RUB (не привязанный к рынку) ──
-            // totalCash уже посчитан выше как сумма RUB-активов
-            // Если limitTotal известен — используем его как итог всего портфеля
-            const portfolioTotal = mp.limitTotal > 0
-              ? mp.limitTotal
-              : totalAbsVal;
+            // Строим строки для пончика: каждая бумага отдельно + кэш
+            const donutRows = [];
+            longs.forEach((a,i) => donutRows.push({ label:a.name, value:a.valuation,      color:LONG_COLORS[i%LONG_COLORS.length] }));
+            shorts.forEach((a,i)=> donutRows.push({ label:a.name, value:Math.abs(a.valuation), color:SHORT_COLORS[i%SHORT_COLORS.length] }));
+            if (stockFree > 0) donutRows.push({ label:'Свободный кэш', value:stockFree, color:'#555b6e' });
 
-            // Строим строки разбивки
-            const rows = [];
+            // Fallback если нет данных
+            if (donutRows.length === 0 && totalCash > 0)
+              donutRows.push({ label:'Кэш', value:totalCash, color:'#555b6e' });
 
-            // Фондовый рынок: бумаги
-            if (stockAssetsVal > 0) {
-              rows.push({ label:'Бумаги (фондовый рынок)', value: stockAssetsVal,
-                color:'#4f8ef7', note: `${longs.length} позиц.` });
-            }
-            // Фондовый рынок: свободный кэш
-            if (stockFree > 0) {
-              rows.push({ label:'Свободный кэш (фондовый)', value: stockFree,
-                color:'#555b6e', note:'лимит средств' });
-            }
-            // Срочный рынок: в позициях (ГО)
-            if (fortsInPositions > 0) {
-              rows.push({ label:'В позициях (срочный рынок)', value: fortsInPositions,
-                color:'#a78bfa', note:'ГО заблокировано' });
-            }
-            // Срочный рынок: свободный кэш
-            if (fortsFree > 0) {
-              rows.push({ label:'Свободный кэш (срочный)', value: fortsFree,
-                color:'#7c3aed', note:'лимит средств' });
-            }
-            // Если нет данных moneyParameters — fallback на обычный кэш
-            if (rows.length === 0) {
-              if (totalCash > 0) rows.push({ label:'Кэш', value: totalCash, color:'#555b6e', note:'' });
-              longs.slice(0,6).forEach((a,i)=>rows.push({
-                label:a.name, value:a.valuation,
-                color:LONG_COLORS[i%LONG_COLORS.length], note:'' }));
-            }
-
-            const grandTotal = rows.reduce((s,r)=>s+r.value, 0) || portfolioTotal || 1;
-
-            const donutRows = rows.map(r=>({label:r.label, value:r.value, color:r.color}));
             const donutSvg = donutSVG(donutRows, 160, 36);
 
             return `
             <div style="margin-bottom:12px;padding:12px 14px;background:var(--bg3);border-radius:var(--radius-sm);border:1px solid var(--border3)">
-              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-                <span style="font-size:11px;color:var(--text3);font-family:var(--mono);text-transform:uppercase;letter-spacing:.07em">Всего портфель</span>
+              <div style="display:flex;align-items:center;justify-content:space-between">
+                <span style="font-size:11px;color:var(--text3);font-family:var(--mono);text-transform:uppercase;letter-spacing:.07em">Фондовый рынок</span>
                 <span style="font-size:18px;font-weight:700;font-family:var(--mono);color:var(--gold2)">${fmt(grandTotal,0)} ₽</span>
               </div>
             </div>
@@ -1713,15 +1797,38 @@ function renderOverview() {
                 </div>
               </div>
               <div style="flex:1;min-width:0">
-                ${rows.map(row=>{
-                  const pct = grandTotal > 0 ? row.value/grandTotal*100 : 0;
-                  return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:7px">
-                    <div style="width:8px;height:8px;border-radius:2px;background:${row.color};flex-shrink:0"></div>
-                    <div style="font-size:11px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)" title="${row.label}">${row.label}${row.note?`<span style="font-size:9px;color:var(--text3);margin-left:4px">${row.note}</span>`:''}</div>
-                    <div style="font-size:11px;font-family:var(--mono);color:var(--text3);white-space:nowrap;min-width:34px;text-align:right">${fmt(pct,1)}%</div>
-                    <div style="font-size:11px;font-family:var(--mono);color:var(--text);white-space:nowrap;min-width:80px;text-align:right">${fmt(row.value,0)} ₽</div>
-                  </div>`;
-                }).join('')}
+                ${longs.length > 0 ? `
+                  <div style="font-size:10px;font-family:var(--mono);color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px">Бумаги — лонг</div>
+                  ${longs.map((a,i)=>{
+                    const pct = grandTotal > 0 ? a.valuation/grandTotal*100 : 0;
+                    return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+                      <div style="width:8px;height:8px;border-radius:2px;background:${LONG_COLORS[i%LONG_COLORS.length]};flex-shrink:0"></div>
+                      <div style="font-size:11px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-weight:600" title="${a.name}">${a.name}</div>
+                      <div style="font-size:11px;font-family:var(--mono);color:var(--text3);white-space:nowrap;min-width:34px;text-align:right">${fmt(pct,1)}%</div>
+                      <div style="font-size:11px;font-family:var(--mono);color:var(--text);white-space:nowrap;min-width:80px;text-align:right">${fmt(a.valuation,0)} ₽</div>
+                    </div>`;
+                  }).join('')}
+                ` : ''}
+                ${shorts.length > 0 ? `
+                  <div style="font-size:10px;font-family:var(--mono);color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-top:8px;margin-bottom:5px">Бумаги — шорт</div>
+                  ${shorts.map((a,i)=>{
+                    const pct = grandTotal > 0 ? Math.abs(a.valuation)/grandTotal*100 : 0;
+                    return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+                      <div style="width:8px;height:8px;border-radius:2px;background:${SHORT_COLORS[i%SHORT_COLORS.length]};flex-shrink:0"></div>
+                      <div style="font-size:11px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-weight:600" title="${a.name}">${a.name}</div>
+                      <div style="font-size:11px;font-family:var(--mono);color:var(--red);white-space:nowrap;min-width:34px;text-align:right">${fmt(pct,1)}%</div>
+                      <div style="font-size:11px;font-family:var(--mono);color:var(--red);white-space:nowrap;min-width:80px;text-align:right">−${fmt(Math.abs(a.valuation),0)} ₽</div>
+                    </div>`;
+                  }).join('')}
+                ` : ''}
+                ${stockFree > 0 ? `
+                  <div style="display:flex;align-items:center;gap:6px;margin-top:${longs.length||shorts.length?'10px':'0'};padding-top:${longs.length||shorts.length?'8px':'0'};border-top:${longs.length||shorts.length?'1px solid var(--border)':'none'}">
+                    <div style="width:8px;height:8px;border-radius:2px;background:#555b6e;flex-shrink:0"></div>
+                    <div style="font-size:11px;flex:1;color:var(--text2)">Свободный кэш <span style="font-size:9px;color:var(--text3)">лимит средств</span></div>
+                    <div style="font-size:11px;font-family:var(--mono);color:var(--text3);white-space:nowrap;min-width:34px;text-align:right">${fmt(stockFree/grandTotal*100,1)}%</div>
+                    <div style="font-size:11px;font-family:var(--mono);color:var(--text);white-space:nowrap;min-width:80px;text-align:right">${fmt(stockFree,0)} ₽</div>
+                  </div>
+                ` : ''}
               </div>
             </div>`;
           })()}
@@ -1733,7 +1840,7 @@ function renderOverview() {
           if (pnlList.length <= THRESHOLD) return ''; // будет выведено снизу во всю ширину
           return `
           <div class="block">
-            <div class="block-title">Фьючерсы — открытые позиции</div>
+            <div class="block-title">Состав портфеля на срочном рынке</div>
             ${latest.futures.length===0?'<div style="color:var(--text3);font-size:12px">Нет открытых позиций</div>':`
             <div class="table-wrap"><table>
               <thead><tr>
@@ -1762,7 +1869,7 @@ function renderOverview() {
       const THRESHOLD = 8;
       if (pnlList.length > THRESHOLD) return '';
       return `
-      <div class="section-title" style="margin-top:4px">Фьючерсы — открытые позиции</div>
+      <div class="section-title" style="margin-top:4px">Состав портфеля на срочном рынке</div>
       ${latest.futures.length===0?'<div style="color:var(--text3);font-size:12px">Нет открытых позиций</div>':`
       <div class="table-wrap"><table>
         <thead><tr>
@@ -2006,10 +2113,18 @@ function renderTrades() {
   const panel = document.getElementById('panel-trades');
   const selType = panel.querySelector('#tradeType')?.value||'all';
   const selDate = panel.querySelector('#tradeDate')?.value||'all';
+  const selEmitter = panel.querySelector('#tradeEmitter')?.value||'all';
   const dates = [...new Set(sorted.map(t=>t.date))]; // уже в правильном порядке
 
+  // Список инструментов — фильтруем по уже выбранному типу чтобы список был релевантным
+  const emittersForType = [...new Set(
+    sorted.filter(t => selType==='all'||t.type===selType).map(t=>t.emitter)
+  )].sort((a,b)=>a.localeCompare(b,'ru'));
+
   const filtered = sorted.filter(t =>
-    (selType==='all'||t.type===selType) && (selDate==='all'||t.date===selDate)
+    (selType==='all'||t.type===selType) &&
+    (selDate==='all'||t.date===selDate) &&
+    (selEmitter==='all'||t.emitter===selEmitter)
   );
 
   panel.innerHTML = `
@@ -2019,6 +2134,10 @@ function renderTrades() {
         <option value="all">Все типы</option>
         <option value="stock">Акции / Облигации</option>
         <option value="futures">Фьючерсы</option>
+      </select>
+      <select id="tradeEmitter" onchange="renderTrades()" style="min-width:160px;max-width:240px">
+        <option value="all">Все инструменты</option>
+        ${emittersForType.map(e=>`<option value="${e}">${e}</option>`).join('')}
       </select>
       <select id="tradeDate" onchange="renderTrades()">
         <option value="all">Все даты</option>
@@ -2045,6 +2164,7 @@ function renderTrades() {
     </table></div>
   `;
   panel.querySelector('#tradeType').value = selType;
+  panel.querySelector('#tradeEmitter').value = selEmitter;
   panel.querySelector('#tradeDate').value = selDate;
 }
 
@@ -2739,7 +2859,8 @@ function renderHelp() {
       <div class="block" style="animation-delay:0.20s">
         <div class="block-title">Расчёт PnL — метод FIFO</div>
         <div style="font-size:13px;color:var(--text2);line-height:1.75">
-          Реализованный доход/убыток рассчитывается по методу FIFO (first in — first out): первые купленные лоты продаются первыми. Для корректного расчёта загружайте отчёты <strong style="color:var(--text)">с самого начала торговли</strong> по данному инструменту. Если покупки за период не найдены — позиция помечается как «унаследованная» со значком ⚠.
+          Реализованный доход/убыток рассчитывается по методу FIFO (first in — first out): первые купленные лоты продаются первыми.<br><br>
+          <strong style="color:var(--text)">Унаследованные позиции:</strong> если в самом раннем загруженном отчёте зафиксирован входящий остаток по инструменту (лонг или шорт), эти лоты считаются унаследованными — цена открытия неизвестна. Первые сделки, закрывающие унаследованную позицию, исключаются из PnL. Как только унаследованные лоты исчерпаны, все последующие сделки считаются по обычному FIFO. Инструменты с унаследованными лотами помечаются «частично*» со значком ⚠.
         </div>
       </div>
       <div class="block" style="animation-delay:0.25s">
