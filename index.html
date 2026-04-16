@@ -892,42 +892,80 @@ function extractPrefix(ticker) {
 // Загружает спецификации всех активных FORTS-фьючерсов с МосБиржи ISS.
 // Строит MOEX_SPEC_CACHE[prefix] = {currency, pointValue, name, source:'moex'}.
 // Вызывается один раз за сессию; после успеха повторно не запрашивает.
+// Собирает уникальные тикеры фьючерсов из всех загруженных отчётов
+function collectFuturesTickers() {
+  const tickers = new Set();
+  for (const r of DB.reports) {
+    // Из сделок срочного рынка
+    for (const t of r.trades || []) {
+      if (t.type === 'futures' && t.emitter) tickers.add(t.emitter);
+    }
+    // Из открытых позиций
+    for (const f of r.futures || []) {
+      if (f.contract) tickers.add(f.contract);
+    }
+  }
+  return [...tickers];
+}
+
+// Запрашивает спецификацию одного тикера с МосБиржи ISS.
+// Возвращает объект {currency, pointValue, name, source} или null если не найден.
+async function fetchOneMoexSpec(ticker) {
+  try {
+    const url = 'https://iss.moex.com/iss/engines/futures/markets/forts/securities/' +
+      encodeURIComponent(ticker) + '.json' +
+      '?iss.meta=off&iss.only=securities' +
+      '&securities.columns=SECID,SHORTNAME,MINSTEP,STEPPRICE,CURRENCYID';
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const rows = data.securities && data.securities.data;
+    if (!rows || rows.length === 0) return null;
+    const cols = data.securities.columns;
+    const row = rows[0];
+    const minstep   = row[cols.indexOf('MINSTEP')]   || 0;
+    const stepprice = row[cols.indexOf('STEPPRICE')] || 0;
+    const currency  = (row[cols.indexOf('CURRENCYID')] || 'RUB') === 'USD' ? 'USD' : 'RUB';
+    const shortname = row[cols.indexOf('SHORTNAME')] || ticker;
+    if (minstep === 0) return null;
+    return {
+      currency,
+      pointValue: parseFloat((stepprice / minstep).toFixed(6)),
+      name: shortname,
+      source: 'moex'
+    };
+  } catch(e) {
+    return null;
+  }
+}
+
 async function loadMoexSpecs() {
   if (moexSpecLoaded || moexSpecLoading) return;
   moexSpecLoading = true;
   try {
-    const url = 'https://iss.moex.com/iss/engines/futures/markets/forts/securities.json' +
-      '?iss.meta=off&iss.only=securities' +
-      '&securities.columns=SECID,SHORTNAME,MINSTEP,STEPPRICE,CURRENCYID' +
-      '&start=0&limit=500';
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    const data = await resp.json();
-    const cols = data.securities.columns;
-    const rows = data.securities.data;
-    const iSecid    = cols.indexOf('SECID');
-    const iShort    = cols.indexOf('SHORTNAME');
-    const iMinstep  = cols.indexOf('MINSTEP');
-    const iStepprice= cols.indexOf('STEPPRICE');
-    const iCurrency = cols.indexOf('CURRENCYID');
+    const tickers = collectFuturesTickers();
+    if (tickers.length === 0) { moexSpecLoaded = true; return; }
 
-    for (const row of rows) {
-      const secid    = row[iSecid]    || '';
-      const shortname= row[iShort]    || '';
-      const minstep  = row[iMinstep]  || 0;
-      const stepprice= row[iStepprice]|| 0;
-      const currency = (row[iCurrency]|| 'RUB') === 'USD' ? 'USD' : 'RUB';
-      if (!secid || minstep === 0) continue;
-      const pointValue = parseFloat((stepprice / minstep).toFixed(6));
-      const prefix = extractPrefix(secid);
-      if (!MOEX_SPEC_CACHE[prefix]) {
-        MOEX_SPEC_CACHE[prefix] = { currency, pointValue, name: shortname, source: 'moex' };
+    // Для каждого тикера из отчёта запрашиваем спецификацию.
+    // Если тикер уже истёк — ISS его не знает, используем префикс из словаря.
+    // Запросы параллельные — все сразу через Promise.all.
+    const results = await Promise.all(tickers.map(async ticker => {
+      const prefix = extractPrefix(ticker);
+      // Если префикс уже в кэше — пропускаем (несколько контрактов одного базового актива)
+      if (MOEX_SPEC_CACHE[prefix]) return;
+      const spec = await fetchOneMoexSpec(ticker);
+      if (spec && !MOEX_SPEC_CACHE[prefix]) {
+        MOEX_SPEC_CACHE[prefix] = spec;
       }
-    }
+    }));
+
     moexSpecLoaded = true;
-    console.log(`[МосБиржа ISS] Загружено ${Object.keys(MOEX_SPEC_CACHE).length} префиксов фьючерсов`);
+    const found = Object.keys(MOEX_SPEC_CACHE).length;
+    const missed = tickers.filter(t => !MOEX_SPEC_CACHE[extractPrefix(t)]).length;
+    console.log(`[МосБиржа ISS] Запрошено ${tickers.length} тикеров, найдено ${found} префиксов` +
+      (missed ? `, не найдено (истёкшие/словарь): ${missed}` : ''));
   } catch(e) {
-    console.warn('[МосБиржа ISS] Не удалось загрузить спецификации:', e.message);
+    console.warn('[МосБиржа ISS] Ошибка загрузки спецификаций:', e.message);
   } finally {
     moexSpecLoading = false;
   }
