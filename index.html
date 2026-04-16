@@ -2155,13 +2155,12 @@ function renderOverview() {
             ${latest.futures.length===0?'<div style="color:var(--text3);font-size:12px">Нет открытых позиций</div>':`
             <div class="table-wrap"><table>
               <thead><tr>
-                <th>Контракт</th><th>Валюта</th><th>Портфель</th><th>Позиция</th><th>Расч. цена</th><th>Вар. маржа за день</th>
+                <th>Контракт</th><th>Портфель</th><th>Позиция</th><th>Расч. цена</th><th>Вар. маржа за день</th>
               </tr></thead>
               <tbody>${latest.futures.map(f=>{
                 const spec=getSpec(f.contract);
                 return `<tr>
                   <td><span class="badge badge-fut">${f.contract}</span></td>
-                  <td class="td-muted td-mono">${spec.currency}</td>
                   <td class="td-muted">${f.portfolio}</td>
                   <td class="td-mono ${f.outgoing>0?'pos':'neg'}">${f.outgoing>0?'+':''}${f.outgoing}</td>
                   <td class="td-mono">${fmt(f.price,3)}</td>
@@ -2184,13 +2183,12 @@ function renderOverview() {
       ${latest.futures.length===0?'<div style="color:var(--text3);font-size:12px">Нет открытых позиций</div>':`
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Контракт</th><th>Валюта</th><th>Портфель</th><th>Позиция</th><th>Расч. цена</th><th>Вар. маржа за день</th>
+          <th>Контракт</th><th>Портфель</th><th>Позиция</th><th>Расч. цена</th><th>Вар. маржа за день</th>
         </tr></thead>
         <tbody>${latest.futures.map(f=>{
           const spec=getSpec(f.contract);
           return `<tr>
             <td><span class="badge badge-fut">${f.contract}</span></td>
-            <td class="td-muted td-mono">${spec.currency}</td>
             <td class="td-muted">${f.portfolio}</td>
             <td class="td-mono ${f.outgoing>0?'pos':'neg'}">${f.outgoing>0?'+':''}${f.outgoing}</td>
             <td class="td-mono">${fmt(f.price,3)}</td>
@@ -2406,13 +2404,12 @@ function renderPositions() {
     <div class="section-title">Фьючерсы</div>
     <div class="table-wrap"><table>
       <thead><tr>
-        <th>Контракт</th><th>Валюта</th><th>Портфель</th><th>Входящий</th><th>Исходящий</th><th>Расч. цена</th><th>Вар. маржа</th>
+        <th>Контракт</th><th>Портфель</th><th>Входящий</th><th>Исходящий</th><th>Расч. цена</th><th>Вар. маржа</th>
       </tr></thead>
       <tbody>${latest.futures.map(f=>{
         const spec=getSpec(f.contract);
         return `<tr>
           <td><span class="badge badge-fut">${f.contract}</span></td>
-          <td class="td-muted td-mono">${spec.currency}</td>
           <td class="td-muted">${f.portfolio}</td>
           <td class="td-mono">${f.incoming||'—'}</td>
           <td class="td-mono ${f.outgoing>0?'pos':'neg'}">${f.outgoing?(f.outgoing>0?'+':'')+f.outgoing:'—'}</td>
