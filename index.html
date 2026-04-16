@@ -3144,7 +3144,7 @@ function renderMoney() {
 // DYNAMICS
 // ─────────────────────────────────────────────────────────────────────────────
 function renderDynamics() {
-  const sorted = DB.reports;
+  const sorted = getFilteredReports();
   if (!sorted.length) return;
 
   // Данные для графиков
