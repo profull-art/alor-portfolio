@@ -1785,60 +1785,114 @@ function calcQualStatus() {
     byMonth[mKey].count += 1;
   });
 
-  const allQuarters = Object.keys(byQuarter).sort();
+  const MONTH_RU = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
   const REQUIRED_QUARTERS = 4;
   const THRESHOLD_VOL     = 6_000_000;
-  const hasEnough = allQuarters.length >= REQUIRED_QUARTERS;
-  const workQuarters = hasEnough
-    ? allQuarters.slice(-REQUIRED_QUARTERS)
-    : allQuarters.slice();
 
-  const quarterDetails = workQuarters.map(qk => {
-    const d = byQuarter[qk];
+  // Определяем «полноту» каждого квартала — все 3 месяца квартала покрыты данными отчётов.
+  // Квартал считается полным, если в byMonth присутствуют все 3 его месяца
+  // (т.е. в отчётах есть хотя бы одна сделка в каждом из трёх месяцев ЛИБО
+  //  все три месяца прошли и мы их загрузили без сделок — но тогда квартала в byQuarter нет).
+  // На практике: квартал полный если activeMonths === 3.
+  function quarterMonths(qk) {
     const [y, qn] = qk.split('-Q').map(Number);
     const startMo = (qn - 1) * 3 + 1;
-    const allQMo  = [startMo, startMo+1, startMo+2]
-      .map(m => `${y}-${String(m).padStart(2,'0')}`);
-    const activeMonths = allQMo.filter(m => byMonth[m] && byMonth[m].count > 0).length;
-    const condCount    = d.count >= 10;
-    const condMonthly  = activeMonths === 3;
+    return [startMo, startMo+1, startMo+2].map(m => `${y}-${String(m).padStart(2,'0')}`);
+  }
+
+  const allQuarters = Object.keys(byQuarter).sort();
+
+  // Помечаем кварталы как полные/неполные
+  const quarterMeta = {};
+  allQuarters.forEach(qk => {
+    const months = quarterMonths(qk);
+    const activeMonths = months.filter(m => byMonth[m] && byMonth[m].count > 0).length;
+    quarterMeta[qk] = { activeMonths, isComplete: activeMonths === 3 };
+  });
+
+  // Полные кварталы — только те, у которых все 3 месяца есть в данных
+  const completeQuarters = allQuarters.filter(qk => quarterMeta[qk].isComplete);
+
+  // Для расчёта критерия используем только полные кварталы
+  const hasEnough = completeQuarters.length >= REQUIRED_QUARTERS;
+  // Берём последние 4 полных квартала для итогового расчёта
+  const workQuarters = hasEnough
+    ? completeQuarters.slice(-REQUIRED_QUARTERS)
+    : completeQuarters.slice();
+
+  // Детализация по рабочим кварталам
+  const quarterDetails = workQuarters.map(qk => {
+    const d = byQuarter[qk];
+    const meta = quarterMeta[qk];
+    const condCount   = d.count >= 10;
+    const condMonthly = meta.activeMonths === 3;
     return {
       key: qk,
       label: qk.replace('-Q', ' Q'),
       vol: d.vol, count: d.count,
-      activeMonths,
+      activeMonths: meta.activeMonths,
+      isComplete: meta.isComplete,
       condCount, condMonthly,
       ok: condCount && condMonthly
     };
   });
 
-  const totalVol      = quarterDetails.reduce((s, q) => s + q.vol, 0);
-  const missingQuarters = Math.max(0, REQUIRED_QUARTERS - allQuarters.length);
-  const condVol       = totalVol >= THRESHOLD_VOL;
-  const condAllQOk    = hasEnough && quarterDetails.every(q => q.ok);
-  const allMet        = hasEnough && condVol && condAllQOk;
+  // Неполные кварталы (есть данные, но не все 3 месяца) — показываем отдельно для информации
+  const incompleteQuarterDetails = allQuarters
+    .filter(qk => !quarterMeta[qk].isComplete)
+    .map(qk => {
+      const d = byQuarter[qk];
+      const meta = quarterMeta[qk];
+      return {
+        key: qk,
+        label: qk.replace('-Q', ' Q'),
+        vol: d.vol, count: d.count,
+        activeMonths: meta.activeMonths,
+        isComplete: false
+      };
+    });
 
-  // Вычисляем конкретные недостающие кварталы и месяцы
-  // Берём последний известный квартал и отсчитываем вперёд недостающие
-  const MONTH_RU = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
+  const totalVol   = quarterDetails.reduce((s, q) => s + q.vol, 0);
+  const condVol    = totalVol >= THRESHOLD_VOL;
+  const condAllQOk = hasEnough && quarterDetails.every(q => q.ok);
+  const allMet     = hasEnough && condVol && condAllQOk;
+
+  // Недостающие кварталы: считаем назад от последнего полного квартала.
+  // Нужно найти 3 квартала ДО последнего полного, которые не являются полными.
+  // Если квартал частично представлен — показываем только недостающие месяцы.
+  const missingCount = Math.max(0, REQUIRED_QUARTERS - completeQuarters.length);
   let missingDetails = [];
-  if (!hasEnough && allQuarters.length > 0) {
-    const lastQ = allQuarters[allQuarters.length - 1];
-    const [lastY, lastQn] = lastQ.split('-Q').map(Number);
-    for (let i = 1; i <= missingQuarters; i++) {
-      let qn = lastQn + i;
-      let y  = lastY;
-      while (qn > 4) { qn -= 4; y++; }
+  if (missingCount > 0 && completeQuarters.length > 0) {
+    // Опорная точка — последний полный квартал
+    const anchorQ = completeQuarters[completeQuarters.length - 1];
+    const [anchorY, anchorQn] = anchorQ.split('-Q').map(Number);
+    for (let i = 1; i <= missingCount; i++) {
+      let qn = anchorQn - i;
+      let y  = anchorY;
+      while (qn < 1) { qn += 4; y--; }
+      const qKey = `${y}-Q${qn}`;
       const startMo = (qn - 1) * 3 + 1;
-      const months  = [startMo, startMo+1, startMo+2].map(m => MONTH_RU[m-1]).join('–');
-      missingDetails.push({ quarter: `${y} Q${qn}`, months, year: y, qn });
+      const allMo = [startMo, startMo+1, startMo+2];
+      // Определяем какие месяцы уже есть в данных
+      const presentMo = allMo.filter(m => {
+        const mk = `${y}-${String(m).padStart(2,'0')}`;
+        return byMonth[mk] && byMonth[mk].count > 0;
+      });
+      const absentMo = allMo.filter(m => !presentMo.includes(m));
+      // Показываем только отсутствующие месяцы
+      const months = absentMo.map(m => MONTH_RU[m-1]).join('–');
+      missingDetails.push({ quarter: `${y} Q${qn}`, months, year: y, qn,
+        partial: presentMo.length > 0, absentCount: absentMo.length });
     }
+    // Хронологический порядок (самый ранний первым)
+    missingDetails.reverse();
   }
 
   return {
-    allQuarters, workQuarters, quarterDetails,
+    allQuarters, workQuarters, completeQuarters,
+    quarterDetails, incompleteQuarterDetails,
     totalVol, condVol, condAllQOk, allMet,
-    hasEnough, missingQuarters, missingDetails,
+    hasEnough, missingQuarters: missingCount, missingDetails,
     byMonth
   };
 }
@@ -1952,11 +2006,7 @@ function renderOverview() {
         <div class="card-value td-mono">${fmt(cashDisplay,0)} <small style="font-size:13px;color:var(--text3)">₽</small></div>
         <div class="card-sub">${totalAbsVal>0?fmt(cashDisplay/totalAbsVal*100,1):'0'}% портфеля</div>
       </div>
-      <div class="card">
-        <div class="card-label">Позиций</div>
-        <div class="card-value">${stockAssets.length}</div>
-        <div class="card-sub">${stockAssets.filter(a=>a.isShort).length} в шорте</div>
-      </div>
+
       <div class="card ${totalPnl>0?'card-gold':''}">
         <div class="card-label">PnL реализованный</div>
         <div class="card-value td-mono ${posNeg(totalPnl)}">${totalPnl>=0?'+':'−'}${fmt(Math.abs(totalPnl),0)} <small style="font-size:16px">₽</small></div>
@@ -2206,7 +2256,8 @@ function renderOverview() {
       }
 
       // Строки по кварталам
-      const quarterRows = qs.hasEnough ? qs.quarterDetails.map(q => {
+      // Полные кварталы — проверяем по критериям
+      const completeRows = qs.quarterDetails.map(q => {
         const ok = q.ok;
         const r=[];
         if(!q.condCount) r.push(`сделок ${q.count} < 10`);
@@ -2215,17 +2266,37 @@ function renderOverview() {
           ? `${fmt(q.vol,0)} ₽ · ${q.count} сделок · все 3 мес. активны`
           : `${fmt(q.vol,0)} ₽ · ${r.join(', ')}`;
         return condRow(ok, q.label, detail, false);
-      }).join('') : qs.quarterDetails.map(q => {
-        return condRow(false, q.label + ' <span style="font-size:10px;color:var(--amber)">(неполный период)</span>',
-          `${fmt(q.vol,0)} ₽ · ${q.count} сделок · загружено данных`, true);
       }).join('');
+
+      // Неполные кварталы — показываем отдельно как справочную информацию
+      const incompleteRows = qs.incompleteQuarterDetails.map(q => {
+        return condRow(false,
+          q.label + ' <span style="font-size:10px;color:var(--amber)">(неполный период)</span>',
+          `${fmt(q.vol,0)} ₽ · ${q.count} сделок · данных за ${q.activeMonths}/3 мес.`,
+          true);
+      }).join('');
+
+      const quarterRows = completeRows + incompleteRows;
 
       const periodLabel = qs.hasEnough
         ? `${qs.workQuarters[0].replace('-Q',' Q')} — ${qs.workQuarters[qs.workQuarters.length-1].replace('-Q',' Q')}`
-        : `${qs.allQuarters[0].replace('-Q',' Q')} — ${qs.allQuarters[qs.allQuarters.length-1].replace('-Q',' Q')} (неполно)`;
+        : qs.completeQuarters.length > 0
+          ? `${qs.completeQuarters[0].replace('-Q',' Q')} — ${qs.completeQuarters[qs.completeQuarters.length-1].replace('-Q',' Q')} · полных кварталов: ${qs.completeQuarters.length}/4`
+          : `${qs.allQuarters[0].replace('-Q',' Q')} — ${qs.allQuarters[qs.allQuarters.length-1].replace('-Q',' Q')} (нет полных кварталов)`;
 
       return `
-      <div class="section-title" style="margin-top:28px">Соответствие требованиям квалифицированного инвестора по оборотам</div>
+      <div class="section-title collapsible-title" style="margin-top:28px;cursor:pointer;user-select:none;display:flex;align-items:center;justify-content:space-between;"
+        onclick="(function(el){
+          var block=el.nextElementSibling;
+          var open=block.style.display!=='none';
+          block.style.display=open?'none':'';
+          el.querySelector('.collapse-arrow').style.transform=open?'rotate(-90deg)':'rotate(0deg)';
+        })(this)">
+        <span>Соответствие требованиям квалифицированного инвестора по оборотам</span>
+        <span class="collapse-arrow" style="display:inline-flex;align-items:center;transition:transform 0.2s;color:var(--text3);margin-left:10px;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="6 9 12 15 18 9"/></svg>
+        </span>
+      </div>
       <div class="block" style="background:${verdictBg};border-color:${verdictColor}22">
 
         <!-- Вердикт -->
@@ -2273,7 +2344,7 @@ function renderOverview() {
               'Все 4 квартала: ≥10 сделок, 3 актив. мес.',
               qs.hasEnough
                 ? `${qs.quarterDetails.filter(q=>q.ok).length} из 4 кварталов выполняют оба условия`
-                : `загружено ${qs.allQuarters.length} из 4 необходимых кварталов`,
+                : `полных кварталов: ${qs.completeQuarters.length} из 4 необходимых`,
               !qs.hasEnough
             )}
             <div style="font-size:10px;color:var(--text3);margin-top:8px;padding-top:8px;border-top:1px solid var(--border);line-height:1.6">
@@ -2286,16 +2357,16 @@ function renderOverview() {
           <div>
             <div style="font-size:11px;font-family:var(--mono);text-transform:uppercase;letter-spacing:0.08em;color:var(--text3);margin-bottom:6px">
               Детализация по кварталам
-              ${!qs.hasEnough?`<span style="color:var(--amber);text-transform:none;letter-spacing:0;margin-left:6px">загружено ${qs.allQuarters.length}/4</span>`:''}
+              ${!qs.hasEnough?`<span style="color:var(--amber);text-transform:none;letter-spacing:0;margin-left:6px">полных ${qs.completeQuarters.length}/4</span>`:''}
             </div>
             ${quarterRows}
-            ${!qs.hasEnough?`
+            ${qs.missingQuarters > 0?`
             <div class="warn-box" style="margin-top:12px;font-size:12px;line-height:1.8">
               <div style="font-weight:600;margin-bottom:4px">Для полного анализа не хватает ${qs.missingQuarters} кв.:</div>
               ${qs.missingDetails.map(d=>`
               <div style="display:flex;align-items:baseline;gap:8px;padding:2px 0">
                 <span style="font-family:var(--mono);font-weight:700;min-width:60px">${d.quarter}</span>
-                <span style="color:inherit;opacity:0.75">${d.months} ${d.year} г.</span>
+                <span style="color:inherit;opacity:0.75">${d.months} ${d.year} г.${d.partial ? ` <span style="color:var(--amber);font-size:10px">(частично загружен, не хватает ${d.absentCount} мес.)</span>` : ''}</span>
               </div>`).join('')}
               <div style="margin-top:6px;opacity:0.75;font-size:11px">Загрузите XML-отчёты за указанные периоды и повторите проверку.</div>
             </div>`:''}
@@ -2585,9 +2656,7 @@ function renderTrades() {
 
   const panel = document.getElementById('panel-trades');
   const selType = panel.querySelector('#tradeType')?.value||'all';
-  const selDate = panel.querySelector('#tradeDate')?.value||'all';
   const selEmitter = panel.querySelector('#tradeEmitter')?.value||'all';
-  const dates = [...new Set(sorted.map(t=>t.date))]; // уже в правильном порядке
 
   // Список инструментов — фильтруем по уже выбранному типу чтобы список был релевантным
   const emittersForType = [...new Set(
@@ -2596,7 +2665,6 @@ function renderTrades() {
 
   const filtered = sorted.filter(t =>
     (selType==='all'||t.type===selType) &&
-    (selDate==='all'||t.date===selDate) &&
     (selEmitter==='all'||t.emitter===selEmitter)
   );
 
@@ -2613,10 +2681,6 @@ function renderTrades() {
       <select id="tradeEmitter" onchange="renderTrades()" style="min-width:160px;max-width:240px">
         <option value="all">Все инструменты</option>
         ${emittersForType.map(e=>`<option value="${e}">${e}</option>`).join('')}
-      </select>
-      <select id="tradeDate" onchange="renderTrades()">
-        <option value="all">Все даты</option>
-        ${dates.map(d=>`<option value="${d}">${d}</option>`).join('')}
       </select>
     </div>
     ${pairsBlock ? `<div class="block" style="margin-bottom:24px;padding:20px 20px 8px">${pairsBlock}</div>` : ''}
@@ -2642,7 +2706,6 @@ function renderTrades() {
   `;
   panel.querySelector('#tradeType').value = selType;
   panel.querySelector('#tradeEmitter').value = selEmitter;
-  panel.querySelector('#tradeDate').value = selDate;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3087,94 +3150,196 @@ function renderDynamics() {
   // Данные для графиков
   const labels = sorted.map(r => r.date);
   const portfolioVals = sorted.map(r => r.assets.reduce((s,a)=>s+a.valuation,0));
-  const cashVals = sorted.map(r => r.assets.filter(a=>a.name==='RUB').reduce((s,a)=>s+a.valuation,0));
   const tradeCounts = sorted.map(r => r.trades.length);
 
   const maxPortfolio = Math.max(...portfolioVals, 1);
+  const minPortfolio = Math.min(...portfolioVals);
   const maxTrades = Math.max(...tradeCounts, 1);
-  const barW = Math.max(32, Math.min(80, Math.floor(520 / Math.max(sorted.length, 1)) - 8));
 
-  // Вертикальный мультибар портфель (portfolio + cash)
-  function portfolioChart() {
-    const H = 160; // высота области баров
-    return `<div style="overflow-x:auto;padding-bottom:4px">
-      <div style="display:flex;align-items:flex-end;gap:8px;min-width:fit-content;padding:8px 0 0">
-        ${sorted.map((r,i)=>{
-          const val = portfolioVals[i];
-          const cash = cashVals[i];
-          const prev = i>0 ? portfolioVals[i-1] : null;
-          const diff = prev !== null ? val - prev : null;
-          const hTotal = Math.round(val / maxPortfolio * H);
-          const hCash  = Math.round(cash / maxPortfolio * H);
-          const hStock = Math.max(0, hTotal - hCash);
-          const diffColor = diff === null ? '' : diff >= 0 ? 'var(--green)' : 'var(--red)';
-          const diffStr = diff === null ? '' : (diff >= 0 ? '+' : '−') + fmt(Math.abs(diff), 0);
-          return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;min-width:${barW}px">
-            ${diff !== null ? `<div style="font-size:10px;font-family:var(--mono);color:${diffColor};white-space:nowrap">${diffStr}</div>` : '<div style="font-size:10px">&nbsp;</div>'}
-            <div style="font-size:10px;font-family:var(--mono);color:var(--text2);white-space:nowrap">${fmt(val,0)}</div>
-            <div style="display:flex;flex-direction:column;justify-content:flex-end;height:${H}px;width:100%">
-              <div style="width:100%;background:var(--accent);border-radius:3px 3px 0 0;height:${hStock}px;min-height:${hStock>0?2:0}px"></div>
-              <div style="width:100%;background:var(--bg4);height:${hCash}px;min-height:${hCash>0?2:0}px;border-radius:${hStock===0?'3px 3px':0} 0 0"></div>
-            </div>
-            <div style="font-size:10px;font-family:var(--mono);color:var(--text3);text-align:center;white-space:nowrap">${r.date}</div>
-          </div>`;
-        }).join('')}
-      </div>
-      <div style="display:flex;gap:16px;margin-top:10px;font-size:11px;color:var(--text3)">
-        <span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--accent);margin-right:5px;vertical-align:middle"></span>Активы</span>
-        <span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--bg4);border:1px solid var(--border2);margin-right:5px;vertical-align:middle"></span>Кэш</span>
-      </div>
+  // Универсальный SVG-график — linechart или histogram
+  // Архитектура: ось Y — отдельный SVG фиксированной ширины (подписи не искажаются),
+  // данные + сетка — отдельный SVG с preserveAspectRatio="none" (растягивается на всю ширину)
+  function makeSvgChart({ vals, chartType, color, fillColor, gradientId, lineGradientId, legendLabel }) {
+    // Логические размеры области данных (без отступов)
+    const DW = 1000, DH = 240;  // viewBox области данных
+    const padT = 14, padB = 0;
+    const chartH = DH - padT - padB;
+    const n = vals.length;
+    if (n < 1) return '<div style="color:var(--text3);font-size:12px;padding:8px 0">Недостаточно данных</div>';
+
+    const maxVal = Math.max(...vals, 1);
+    const minVal = chartType === 'line' ? Math.min(...vals) : 0;
+    const range = maxVal - minVal || 1;
+    const yPadTop = range * 0.08;
+    const yPadBot = chartType === 'line' ? range * 0.10 : 0;
+    const yMin = minVal - yPadBot;
+    const yMax = maxVal + yPadTop;
+    const yRange = yMax - yMin;
+
+    // Координаты в пространстве viewBox данных (0..DW × 0..DH)
+    function xCoord(i) { return n > 1 ? (i / (n - 1)) * DW : DW / 2; }
+    function xCoordBar(i) { return (i / n) * DW; }
+    function yCoord(v) { return padT + chartH - ((v - yMin) / yRange) * chartH; }
+
+    // Ось Y — «красивые» значения
+    const rawStep = yRange / 5;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(rawStep || 1)));
+    const niceStep = Math.ceil(rawStep / magnitude) * magnitude || 1;
+    const yStart = Math.floor(yMin / niceStep) * niceStep;
+    const yGridLines = [];
+    for (let v = yStart; v <= yMax + niceStep * 0.01; v += niceStep) {
+      const y = yCoord(v);
+      if (y < padT - 4 || y > DH + 4) continue;
+      const label = v >= 1e6 ? (v/1e6).toFixed(1).replace('.0','') + 'M'
+                  : v >= 1000 ? Math.round(v/1000) + '\u00a0тыс.'
+                  : Math.round(v);
+      yGridLines.push({ y, label });
+    }
+
+    // Позиции меток оси X как доля 0..1
+    const xLabelCount = Math.min(n, 6);
+    const xLabels = [];
+    for (let i = 0; i < xLabelCount; i++) {
+      const idx = Math.round(i * (n - 1) / Math.max(xLabelCount - 1, 1));
+      xLabels.push({ frac: n > 1 ? idx / (n - 1) : 0.5, label: sorted[idx].date });
+    }
+
+    // Данные
+    let chartContent = '';
+    if (chartType === 'line') {
+      const pathD = vals.map((v,i) => (i===0?'M':'L') + xCoord(i).toFixed(2) + ' ' + yCoord(v).toFixed(2)).join(' ');
+      const fillD = pathD + ` L${xCoord(n-1).toFixed(2)},${DH} L0,${DH} Z`;
+      chartContent = `
+        <path d="${fillD}" fill="url(#${gradientId})"/>
+        <path d="${pathD}" fill="none" stroke="${color}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+        ${n <= 80 ? vals.map((v,i)=>`<circle cx="${xCoord(i).toFixed(2)}" cy="${yCoord(v).toFixed(2)}" r="2" fill="${color}" opacity="0.55"/>`).join('') : ''}`;
+    } else {
+      const barW = DW / n;
+      chartContent = vals.map((v,i) => {
+        const x = xCoordBar(i);
+        const bh = Math.max(v > 0 ? 1.5 : 0, ((v - yMin) / yRange) * chartH);
+        const y = padT + chartH - bh;
+        const gap = Math.min(3, barW * 0.18);
+        return `<rect x="${(x+gap/2).toFixed(2)}" y="${y.toFixed(2)}" width="${Math.max(1,barW-gap).toFixed(2)}" height="${bh.toFixed(2)}" fill="${color}" rx="1.5" opacity="0.85"/>`;
+      }).join('');
+    }
+
+    // Сетка (рисуется в том же пространстве что и данные — растягивается вместе)
+    const gridSvg = yGridLines.map(({y}) =>
+      `<line x1="0" y1="${y.toFixed(2)}" x2="${DW}" y2="${y.toFixed(2)}" stroke="rgba(255,255,255,0.07)" stroke-width="1" stroke-dasharray="4,6"/>`
+    ).join('') +
+    `<line x1="0" y1="${(padT+chartH).toFixed(2)}" x2="${DW}" y2="${(padT+chartH).toFixed(2)}" stroke="rgba(255,255,255,0.13)" stroke-width="1"/>`;
+
+    // SVG оси Y — фиксированная ширина 62px, высота совпадает с данными
+    // Позиции Y масштабируем: у данных реальная высота 240px через SVG, здесь — HTML 240px
+    const axisYHtml = `<div style="flex-shrink:0;width:62px;position:relative;height:240px">
+      ${yGridLines.map(({y, label}) => {
+        const pct = (y / DH * 100).toFixed(2);
+        return `<div style="position:absolute;top:${pct}%;right:6px;transform:translateY(-50%);
+          font-size:11px;font-family:'Fira Code',monospace;color:rgba(140,150,170,0.9);white-space:nowrap;line-height:1">${label}</div>`;
+      }).join('')}
     </div>`;
+
+    // SVG данных — растягивается на всю оставшуюся ширину без искажений
+    const dataSvg = `<svg viewBox="0 0 ${DW} ${DH}" preserveAspectRatio="none" style="flex:1;height:240px;display:block;min-width:0">
+      <defs>
+        <linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="${fillColor}" stop-opacity="0.22"/>
+          <stop offset="100%" stop-color="${fillColor}" stop-opacity="0.02"/>
+        </linearGradient>
+      </defs>
+      ${gridSvg}
+      ${chartContent}
+    </svg>`;
+
+    // Ось X — HTML поверх области данных, позиции через % от ширины dataSvg
+    // Крайние метки прижаты к краям чтобы не вылезать за границы
+    const axisXHtml = `<div style="padding-left:62px;position:relative;height:22px;margin-top:2px;overflow:hidden">
+      ${xLabels.map(({frac, label}, li) => {
+        const isFirst = li === 0;
+        const isLast = li === xLabels.length - 1;
+        const leftPct = (frac * 100).toFixed(2);
+        const transform = isFirst ? 'translateX(0)' : isLast ? 'translateX(-100%)' : 'translateX(-50%)';
+        return `<div style="position:absolute;left:${leftPct}%;transform:${transform};
+          font-size:11px;font-family:'Fira Code',monospace;color:rgba(140,150,170,0.9);white-space:nowrap">${label}</div>`;
+      }).join('')}
+    </div>`;
+
+    return `
+      <div style="width:100%">
+        <div style="display:flex;align-items:stretch">
+          ${axisYHtml}
+          ${dataSvg}
+        </div>
+        ${axisXHtml}
+        <div style="display:flex;gap:16px;margin-top:6px;padding-left:62px;font-size:11px;color:var(--text3)">
+          ${chartType==='line'
+            ? `<span><span style="display:inline-block;width:24px;height:2px;background:${color};margin-right:5px;vertical-align:middle;border-radius:2px"></span>${legendLabel}</span>`
+            : `<span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:${color};opacity:0.85;margin-right:5px;vertical-align:middle"></span>${legendLabel}</span>`
+          }
+        </div>
+      </div>`;
   }
 
-  // Вертикальный бар активность
+  function portfolioLineChart() {
+    return makeSvgChart({
+      vals: portfolioVals,
+      chartType: 'line',
+      color: '#3b82f6',
+      fillColor: '#3b82f6',
+      gradientId: 'portFill',
+      lineGradientId: 'portLine',
+      legendLabel: 'Портфель'
+    });
+  }
+
   function activityChart() {
-    const H = 120;
-    return `<div style="overflow-x:auto;padding-bottom:4px">
-      <div style="display:flex;align-items:flex-end;gap:8px;min-width:fit-content;padding:8px 0 0">
-        ${sorted.map((r,i)=>{
-          const cnt = tradeCounts[i];
-          const h = Math.round(cnt / maxTrades * H);
-          return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;min-width:${barW}px">
-            <div style="font-size:10px;font-family:var(--mono);color:var(--text2)">${cnt}</div>
-            <div style="display:flex;flex-direction:column;justify-content:flex-end;height:${H}px;width:100%">
-              <div style="width:100%;background:var(--purple);border-radius:3px 3px 0 0;height:${Math.max(h,2)}px"></div>
-            </div>
-            <div style="font-size:10px;font-family:var(--mono);color:var(--text3);white-space:nowrap">${r.date}</div>
-          </div>`;
-        }).join('')}
-      </div>
-    </div>`;
+    return makeSvgChart({
+      vals: tradeCounts,
+      chartType: 'histogram',
+      color: 'var(--purple)',
+      fillColor: 'var(--purple)',
+      gradientId: 'actFill',
+      lineGradientId: 'actLine',
+      legendLabel: 'Сделок за день'
+    });
   }
+
+  const summaryId = 'dyn-summary-' + Date.now();
 
   document.getElementById('panel-dynamics').innerHTML = `
     <div class="panel-title">Динамика</div>
 
     <div class="section-title">Оценка портфеля по дням</div>
-    <div class="block">${portfolioChart()}</div>
+    <div class="block" style="padding:20px 20px 16px">${portfolioLineChart()}</div>
 
     <div class="section-title" style="margin-top:24px">Активность — сделки по дням</div>
-    <div class="block">${activityChart()}</div>
+    <div class="block" style="padding:20px 20px 16px">${activityChart()}</div>
 
-    <div class="section-title" style="margin-top:24px">Сводная таблица</div>
-    <div class="table-wrap"><table>
-      <thead><tr>
-        <th>Дата</th><th>Курс USD</th><th>Позиций</th><th>Фьючерсов</th><th>РЕПО</th><th>Сделок</th><th>Затраты, ₽</th>
-      </tr></thead>
-      <tbody>${sorted.map(r=>{
-        const fee=r.trades.reduce((s,t)=>s+t.totalFee,0)
-          +r.repoTrades.reduce((s,r)=>s+Math.abs(r.totalCost),0);
-        return `<tr>
-          <td class="td-mono">${r.date}</td>
-          <td class="td-mono td-muted">${fmt(r.usdRate,4)}</td>
-          <td>${r.assets.filter(a=>a.name!=='RUB').length}</td>
-          <td>${r.futures.length}</td>
-          <td>${r.repoTrades.length}</td>
-          <td>${r.trades.length}</td>
-          <td class="td-mono neg">${fmt(fee,2)}</td>
-        </tr>`;
-      }).join('')}</tbody>
-    </table></div>
+    <div class="section-title" style="margin-top:24px;cursor:pointer;user-select:none" onclick="(function(){var b=document.getElementById('${summaryId}');var a=document.getElementById('${summaryId}-arrow');if(b.style.display==='none'){b.style.display='';a.style.transform='rotate(0deg)'}else{b.style.display='none';a.style.transform='rotate(-90deg)'}})()">
+      Сводная таблица
+      <span id="${summaryId}-arrow" style="margin-left:6px;display:inline-block;transition:transform 0.2s;font-size:10px;color:var(--text3)">▼</span>
+    </div>
+    <div id="${summaryId}">
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Дата</th><th>Курс USD</th><th>Позиций</th><th>Фьючерсов</th><th>РЕПО</th><th>Сделок</th><th>Затраты, ₽</th>
+        </tr></thead>
+        <tbody>${sorted.map(r=>{
+          const fee=r.trades.reduce((s,t)=>s+t.totalFee,0)
+            +r.repoTrades.reduce((s,r)=>s+Math.abs(r.totalCost),0);
+          return `<tr>
+            <td class="td-mono">${r.date}</td>
+            <td class="td-mono td-muted">${fmt(r.usdRate,4)}</td>
+            <td>${r.assets.filter(a=>a.name!=='RUB').length}</td>
+            <td>${r.futures.length}</td>
+            <td>${r.repoTrades.length}</td>
+            <td>${r.trades.length}</td>
+            <td class="td-mono neg">${fmt(fee,2)}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table></div>
+    </div>
   `;
 }
 
