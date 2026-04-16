@@ -807,25 +807,182 @@ select:hover, select:focus { border-color:var(--gold); box-shadow: 0 0 0 3px rgb
 <script>
 // ─────────────────────────────────────────────────────────────────────────────
 // CONTRACT SPECS
+// Встроенный словарь по префиксам — fallback для истёкших контрактов и офлайн-режима.
+// Автоматически дополняется данными МосБиржи (ISS API) при загрузке отчёта.
 // ─────────────────────────────────────────────────────────────────────────────
 const CONTRACT_SPECS = {
-  'BR':      { currency:'USD', pointValue:10.0  },
-  'Si':      { currency:'RUB', pointValue:1.0   },
-  'RTS':     { currency:'USD', pointValue:0.02  },
-  'RI':      { currency:'USD', pointValue:0.02  },
-  'GLDRUBF': { currency:'RUB', pointValue:1.0   },
-  'GLD':     { currency:'RUB', pointValue:1.0   },
-  'IMOEXF':  { currency:'RUB', pointValue:5.0   },
-  'MXI':     { currency:'RUB', pointValue:1.0   },
-  'NG':      { currency:'USD', pointValue:10.0  },
-  'GD':      { currency:'USD', pointValue:1.0   },
-  'GOLD':    { currency:'USD', pointValue:1.0   },
-  'ED':      { currency:'RUB', pointValue:1.0   },
+  // ── Товарные (USD) ──────────────────────────────────────────────────────────
+  'BR':      { currency:'USD', pointValue:10.0,  name:'Нефть Brent'         },
+  'NG':      { currency:'USD', pointValue:10.0,  name:'Природный газ'       },
+  'GD':      { currency:'USD', pointValue:1.0,   name:'Золото (USD)'        },
+  'GOLD':    { currency:'USD', pointValue:1.0,   name:'Золото (USD)'        },
+  'PL':      { currency:'USD', pointValue:1.0,   name:'Платина'             },
+  'PA':      { currency:'USD', pointValue:1.0,   name:'Палладий'            },
+  'CU':      { currency:'USD', pointValue:1.0,   name:'Медь'                },
+  'AL':      { currency:'USD', pointValue:1.0,   name:'Алюминий'            },
+  'Co':      { currency:'USD', pointValue:1.0,   name:'Кобальт'             },
+  // ── Индексы (USD) ───────────────────────────────────────────────────────────
+  'RTS':     { currency:'USD', pointValue:0.02,  name:'Индекс РТС'          },
+  'RI':      { currency:'USD', pointValue:0.02,  name:'Индекс РТС (мини)'   },
+  // ── Индексы (RUB) ───────────────────────────────────────────────────────────
+  'MX':      { currency:'RUB', pointValue:1.0,   name:'Индекс МосБиржи'     },
+  'MXI':     { currency:'RUB', pointValue:1.0,   name:'Индекс МосБиржи мини'},
+  'IMOEXF':  { currency:'RUB', pointValue:5.0,   name:'Индекс МосБиржи (фьюч.)'},
+  // ── Валюта (RUB) ────────────────────────────────────────────────────────────
+  'Si':      { currency:'RUB', pointValue:1.0,   name:'USD/RUB'             },
+  'ED':      { currency:'RUB', pointValue:1.0,   name:'EUR/USD'             },
+  'Eu':      { currency:'RUB', pointValue:1.0,   name:'EUR/RUB'             },
+  'CNYRUB':  { currency:'RUB', pointValue:1.0,   name:'CNY/RUB'             },
+  'CY':      { currency:'RUB', pointValue:1.0,   name:'CNY/RUB'             },
+  // ── Золото в рублях ─────────────────────────────────────────────────────────
+  'GLDRUBF': { currency:'RUB', pointValue:1.0,   name:'Золото (RUB)'        },
+  'GLD':     { currency:'RUB', pointValue:1.0,   name:'Золото (RUB)'        },
+  // ── Акции (RUB) — pointValue всегда 1.0 ────────────────────────────────────
+  'SR':      { currency:'RUB', pointValue:1.0,   name:'Сбербанк'            },
+  'GZ':      { currency:'RUB', pointValue:1.0,   name:'Газпром'             },
+  'LK':      { currency:'RUB', pointValue:1.0,   name:'Лукойл'              },
+  'GM':      { currency:'RUB', pointValue:1.0,   name:'ГМК НорНикель'       },
+  'VB':      { currency:'RUB', pointValue:1.0,   name:'ВТБ'                 },
+  'TT':      { currency:'RUB', pointValue:1.0,   name:'Татнефть'            },
+  'MG':      { currency:'RUB', pointValue:1.0,   name:'Магнит'              },
+  'YN':      { currency:'RUB', pointValue:1.0,   name:'Яндекс'              },
+  'RN':      { currency:'RUB', pointValue:1.0,   name:'Роснефть'            },
+  'NK':      { currency:'RUB', pointValue:1.0,   name:'НЛМК'                },
+  'MT':      { currency:'RUB', pointValue:1.0,   name:'МТС'                 },
+  'MN':      { currency:'RUB', pointValue:1.0,   name:'ММК'                 },
+  'CH':      { currency:'RUB', pointValue:1.0,   name:'ЧМК'                 },
+  'NM':      { currency:'RUB', pointValue:1.0,   name:'Норникель мини'      },
+  'AF':      { currency:'RUB', pointValue:1.0,   name:'Аэрофлот'            },
+  'NU':      { currency:'RUB', pointValue:1.0,   name:'Новатэк'             },
+  'PO':      { currency:'RUB', pointValue:1.0,   name:'Полюс'               },
+  'SG':      { currency:'RUB', pointValue:1.0,   name:'Сегежа'              },
+  'TR':      { currency:'RUB', pointValue:1.0,   name:'Татнефть прив.'      },
+  'HY':      { currency:'RUB', pointValue:1.0,   name:'HeadHunter'          },
+  'FV':      { currency:'RUB', pointValue:1.0,   name:'ФосАгро'             },
+  'TN':      { currency:'RUB', pointValue:1.0,   name:'Транснефть'          },
+  'IM':      { currency:'RUB', pointValue:1.0,   name:'Интер РАО'           },
+  'ME':      { currency:'RUB', pointValue:1.0,   name:'Мосэнерго'           },
+  'RU':      { currency:'RUB', pointValue:1.0,   name:'РусГидро'            },
+  'SL':      { currency:'RUB', pointValue:1.0,   name:'СберПреф'            },
+  'OZ':      { currency:'RUB', pointValue:1.0,   name:'Озон'                },
+  'SP':      { currency:'RUB', pointValue:1.0,   name:'Сургутнефтегаз прив.'},
+  'SN':      { currency:'RUB', pointValue:1.0,   name:'Сургутнефтегаз'      },
+  'TZ':      { currency:'RUB', pointValue:1.0,   name:'ТКС Холдинг'         },
+  'WM':      { currency:'RUB', pointValue:1.0,   name:'ВК'                  },
+  // ── Облигации / ставки (RUB) ────────────────────────────────────────────────
+  'OF':      { currency:'RUB', pointValue:1.0,   name:'ОФЗ'                 },
+  'OFZ':     { currency:'RUB', pointValue:1.0,   name:'ОФЗ'                 },
+  'RUONIA':  { currency:'RUB', pointValue:1.0,   name:'RUONIA'              },
+  'MOEXREPO':{ currency:'RUB', pointValue:1.0,   name:'MOEX REPO'           },
 };
+
+// Кэш спецификаций, полученных с МосБиржи (ISS). Ключ — префикс тикера.
+// Заполняется один раз за сессию при первой загрузке отчёта.
+const MOEX_SPEC_CACHE = {};
+let moexSpecLoaded = false;   // true после успешного запроса к ISS
+let moexSpecLoading = false;  // флаг защиты от параллельных запросов
+
+// Извлекает префикс из тикера фьючерса: "BRH5" → "BR", "SRZ4" → "SR"
+// Prefix — всё, что до кода месяца (F,G,H,J,K,M,N,Q,U,V,X,Z) и цифры года.
+function extractPrefix(ticker) {
+  const m = ticker.match(/^([A-Za-z]+)[FGHJKMNQUVXZ]\d/);
+  return m ? m[1] : ticker;
+}
+
+// Загружает спецификации всех активных FORTS-фьючерсов с МосБиржи ISS.
+// Строит MOEX_SPEC_CACHE[prefix] = {currency, pointValue, name, source:'moex'}.
+// Вызывается один раз за сессию; после успеха повторно не запрашивает.
+async function loadMoexSpecs() {
+  if (moexSpecLoaded || moexSpecLoading) return;
+  moexSpecLoading = true;
+  try {
+    const url = 'https://iss.moex.com/iss/engines/futures/markets/forts/securities.json' +
+      '?iss.meta=off&iss.only=securities' +
+      '&securities.columns=SECID,SHORTNAME,MINSTEP,STEPPRICE,CURRENCYID' +
+      '&start=0&limit=500';
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const cols = data.securities.columns;
+    const rows = data.securities.data;
+    const iSecid    = cols.indexOf('SECID');
+    const iShort    = cols.indexOf('SHORTNAME');
+    const iMinstep  = cols.indexOf('MINSTEP');
+    const iStepprice= cols.indexOf('STEPPRICE');
+    const iCurrency = cols.indexOf('CURRENCYID');
+
+    for (const row of rows) {
+      const secid    = row[iSecid]    || '';
+      const shortname= row[iShort]    || '';
+      const minstep  = row[iMinstep]  || 0;
+      const stepprice= row[iStepprice]|| 0;
+      const currency = (row[iCurrency]|| 'RUB') === 'USD' ? 'USD' : 'RUB';
+      if (!secid || minstep === 0) continue;
+      const pointValue = parseFloat((stepprice / minstep).toFixed(6));
+      const prefix = extractPrefix(secid);
+      if (!MOEX_SPEC_CACHE[prefix]) {
+        MOEX_SPEC_CACHE[prefix] = { currency, pointValue, name: shortname, source: 'moex' };
+      }
+    }
+    moexSpecLoaded = true;
+    console.log(`[МосБиржа ISS] Загружено ${Object.keys(MOEX_SPEC_CACHE).length} префиксов фьючерсов`);
+  } catch(e) {
+    console.warn('[МосБиржа ISS] Не удалось загрузить спецификации:', e.message);
+  } finally {
+    moexSpecLoading = false;
+  }
+}
+
+// Возвращает спецификацию контракта.
+// Приоритет: 1) кэш МосБиржи  2) встроенный словарь  3) дефолт RUB/1.0
 function getSpec(contract) {
+  const prefix = extractPrefix(contract);
+  // 1. Данные с МосБиржи (свежие, наиболее точные)
+  if (MOEX_SPEC_CACHE[prefix]) return MOEX_SPEC_CACHE[prefix];
+  // 2. Встроенный словарь — сначала точное совпадение по префиксу
+  if (CONTRACT_SPECS[prefix]) return CONTRACT_SPECS[prefix];
+  // 3. Встроенный словарь — совпадение по startsWith (для длинных ключей типа GLDRUBF)
   for (const [pfx, spec] of Object.entries(CONTRACT_SPECS))
     if (contract.startsWith(pfx)) return spec;
-  return { currency:'RUB', pointValue:1.0 };
+  // 4. Дефолт
+  return { currency:'RUB', pointValue:1.0, name: contract };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MOEX LOADING OVERLAY
+// Показывается пока ждём спецификации с МосБиржи — блокирует преждевременный рендер
+// ─────────────────────────────────────────────────────────────────────────────
+function showMoexLoadingOverlay() {
+  let el = document.getElementById('moex-loading-overlay');
+  if (el) { el.style.display = 'flex'; return; }
+  el = document.createElement('div');
+  el.id = 'moex-loading-overlay';
+  el.style.cssText = [
+    'position:fixed;inset:0;z-index:9999;',
+    'background:rgba(8,10,15,0.82);',
+    'backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);',
+    'display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;'
+  ].join('');
+  el.innerHTML =
+    '<div style="width:48px;height:48px;border-radius:50%;' +
+    'border:3px solid rgba(212,168,67,0.15);border-top-color:var(--gold);' +
+    'animation:moex-spin 0.8s linear infinite"></div>' +
+    '<div style="text-align:center">' +
+    '<div style="font-size:15px;font-weight:600;color:var(--text);margin-bottom:4px">Загружаем спецификации фьючерсов</div>' +
+    '<div style="font-size:12px;color:var(--text2)">Запрос к МосБирже ISS — валюта и стоимость шага цены</div>' +
+    '</div>';
+  if (!document.getElementById('moex-spin-style')) {
+    const s = document.createElement('style');
+    s.id = 'moex-spin-style';
+    s.textContent = '@keyframes moex-spin{to{transform:rotate(360deg)}}';
+    document.head.appendChild(s);
+  }
+  document.body.appendChild(el);
+}
+
+function hideMoexLoadingOverlay() {
+  const el = document.getElementById('moex-loading-overlay');
+  if (el) el.style.display = 'none';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1191,7 +1348,17 @@ function loadFiles(files) {
         });
         DB.reports.sort((a,b) => a.sortDate.localeCompare(b.sortDate));
         updatePeriodPicker();
-        renderAll();
+        // Сначала получаем спецификации с МосБиржи, только потом рендерим.
+        // Если спецификации уже загружены (повторная загрузка) — рендерим сразу.
+        if (moexSpecLoaded) {
+          renderAll();
+        } else {
+          showMoexLoadingOverlay();
+          loadMoexSpecs().finally(() => {
+            hideMoexLoadingOverlay();
+            renderAll();
+          });
+        }
       }
     };
     reader.readAsText(file, 'windows-1251');
@@ -2184,9 +2351,13 @@ function renderOverview() {
               </tr></thead>
               <tbody>${latest.futures.map(f=>{
                 const spec=getSpec(f.contract);
+                const srcTip = spec.source==='moex' ? ' title="Спецификация получена с МосБиржи ISS"' : ' title="Встроенный словарь"';
+                const srcDot = spec.source==='moex'
+                  ? '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--teal);margin-left:4px;vertical-align:middle" title="МосБиржа ISS"></span>'
+                  : '';
                 return `<tr>
                   <td><span class="badge badge-fut">${f.contract}</span></td>
-                  <td class="td-muted td-mono">${spec.currency}</td>
+                  <td class="td-muted td-mono"${srcTip}>${spec.currency}${srcDot}</td>
                   <td class="td-muted">${f.portfolio}</td>
                   <td class="td-mono ${f.outgoing>0?'pos':'neg'}">${f.outgoing>0?'+':''}${f.outgoing}</td>
                   <td class="td-mono">${fmt(f.price,3)}</td>
@@ -2213,9 +2384,13 @@ function renderOverview() {
         </tr></thead>
         <tbody>${latest.futures.map(f=>{
           const spec=getSpec(f.contract);
+          const srcTip = spec.source==='moex' ? ' title="Спецификация получена с МосБиржи ISS"' : ' title="Встроенный словарь"';
+          const srcDot = spec.source==='moex'
+            ? '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--teal);margin-left:4px;vertical-align:middle" title="МосБиржа ISS"></span>'
+            : '';
           return `<tr>
             <td><span class="badge badge-fut">${f.contract}</span></td>
-            <td class="td-muted td-mono">${spec.currency}</td>
+            <td class="td-muted td-mono"${srcTip}>${spec.currency}${srcDot}</td>
             <td class="td-muted">${f.portfolio}</td>
             <td class="td-mono ${f.outgoing>0?'pos':'neg'}">${f.outgoing>0?'+':''}${f.outgoing}</td>
             <td class="td-mono">${fmt(f.price,3)}</td>
@@ -2435,9 +2610,13 @@ function renderPositions() {
       </tr></thead>
       <tbody>${latest.futures.map(f=>{
         const spec=getSpec(f.contract);
+        const srcTip = spec.source==='moex' ? ' title="Спецификация получена с МосБиржи ISS"' : ' title="Встроенный словарь"';
+        const srcDot = spec.source==='moex'
+          ? '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--teal);margin-left:4px;vertical-align:middle" title="МосБиржа ISS"></span>'
+          : '';
         return `<tr>
           <td><span class="badge badge-fut">${f.contract}</span></td>
-          <td class="td-muted td-mono">${spec.currency}</td>
+          <td class="td-muted td-mono"${srcTip}>${spec.currency}${srcDot}</td>
           <td class="td-muted">${f.portfolio}</td>
           <td class="td-mono">${f.incoming||'—'}</td>
           <td class="td-mono ${f.outgoing>0?'pos':'neg'}">${f.outgoing?(f.outgoing>0?'+':'')+f.outgoing:'—'}</td>
@@ -3541,6 +3720,13 @@ function renderHelp() {
         <div class="block-title">Курс USD</div>
         <div style="font-size:13px;color:var(--text2);line-height:1.75">
           Курс доллара ЦБ РФ считывается напрямую из каждого XML отчёта. Фьючерсы на USD-контракты (нефть BR, индекс RTS, золото GD и др.) конвертируются в рубли по курсу на <strong style="color:var(--text)">дату продажи</strong>.
+        </div>
+      </div>
+      <div class="block" style="animation-delay:0.32s">
+        <div class="block-title">Спецификации фьючерсов</div>
+        <div style="font-size:13px;color:var(--text2);line-height:1.75">
+          При загрузке отчёта кабинет автоматически запрашивает спецификации всех активных FORTS-фьючерсов через <strong style="color:var(--text)">публичный API МосБиржи (ISS)</strong> — валюта контракта и стоимость шага цены (<em>pointValue</em>). Полученные данные кэшируются на сессию.
+          Для истёкших контрактов используется встроенный словарь префиксов (BR&nbsp;→ USD/10, Si&nbsp;→ RUB/1 и т.д.), так как биржа хранит только текущие серии. В таблицах фьючерсов <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--teal);vertical-align:middle"></span> означает, что спецификация получена с МосБиржи в реальном времени.
         </div>
       </div>
       <div class="block" style="animation-delay:0.35s">
