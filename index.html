@@ -1951,6 +1951,26 @@ function renderOverview() {
   const totalPnl = pnlList.reduce((s,x)=>s+x.pnl,0);
   const maxAbsPnl = Math.max(...pnlList.map(x=>Math.abs(x.pnl)),1);
 
+  // Прирост капитала:
+  //   База = портфель первого отчёта (кэш + бумаги) + пополнения ПОСЛЕ первого отчёта − выводы ПОСЛЕ первого отчёта
+  //   Прирост = Портфель_сейчас − База
+  // Логика: первый отчёт уже включает кэш от первого пополнения,
+  //         поэтому добавляем только довнесения начиная со второго отчёта (строго после даты первого).
+  const _filteredReports = getFilteredReports();
+  const _firstReport     = _filteredReports[0];
+  const _firstDate       = _firstReport ? _firstReport.sortDate : '';
+  const _portfolioStart  = _firstReport
+    ? _firstReport.assets.reduce((s,a) => s + a.valuation, 0)
+    : 0;
+  // Берём только движения денег строго ПОСЛЕ даты первого отчёта
+  const _mfAfterFirst    = _mf.filter(f => f.sortDate > _firstDate);
+  const _deposits        = _mfAfterFirst.filter(f => f.category==='deposit').reduce((s,f) => s+f.amount, 0);
+  const _withdrawals     = _mfAfterFirst.filter(f => f.category==='withdrawal').reduce((s,f) => s+Math.abs(f.amount), 0);
+  const _otherIncome     = _mfAfterFirst.filter(f => f.category==='other'||f.category==='dividend'||f.category==='coupon').reduce((s,f) => s+f.amount, 0);
+  const _base            = _portfolioStart + _deposits - _withdrawals + _otherIncome;
+  const capitalGrowth    = totalAbsVal - _base;
+  const capitalGrowthPct = _base > 0 ? capitalGrowth / _base * 100 : 0;
+
   const popular = calcPopular();
   const maxPop = popular[0]?.[1]||1;
 
@@ -2011,6 +2031,11 @@ function renderOverview() {
         <div class="card-label">PnL реализованный</div>
         <div class="card-value td-mono ${posNeg(totalPnl)}">${totalPnl>=0?'+':'−'}${fmt(Math.abs(totalPnl),0)} <small style="font-size:16px">₽</small></div>
         <div class="card-sub">FIFO, закрытые позиции</div>
+      </div>
+      <div class="card ${capitalGrowth>0?'card-gold':''}">
+        <div class="card-label">Прирост капитала</div>
+        <div class="card-value td-mono ${capitalGrowth>=0?'pos':'neg'}">${capitalGrowth>=0?'+':'−'}${fmt(Math.abs(capitalGrowth),0)} <small style="font-size:16px">₽</small></div>
+        <div class="card-sub">${capitalGrowth>=0?'+':''}${fmt(capitalGrowthPct,2)}% к базе периода</div>
       </div>
       <div class="card">
         <div class="card-label">Комиссии итого</div>
@@ -2155,12 +2180,13 @@ function renderOverview() {
             ${latest.futures.length===0?'<div style="color:var(--text3);font-size:12px">Нет открытых позиций</div>':`
             <div class="table-wrap"><table>
               <thead><tr>
-                <th>Контракт</th><th>Портфель</th><th>Позиция</th><th>Расч. цена</th><th>Вар. маржа за день</th>
+                <th>Контракт</th><th>Валюта</th><th>Портфель</th><th>Позиция</th><th>Расч. цена</th><th>Вар. маржа за день</th>
               </tr></thead>
               <tbody>${latest.futures.map(f=>{
                 const spec=getSpec(f.contract);
                 return `<tr>
                   <td><span class="badge badge-fut">${f.contract}</span></td>
+                  <td class="td-muted td-mono">${spec.currency}</td>
                   <td class="td-muted">${f.portfolio}</td>
                   <td class="td-mono ${f.outgoing>0?'pos':'neg'}">${f.outgoing>0?'+':''}${f.outgoing}</td>
                   <td class="td-mono">${fmt(f.price,3)}</td>
@@ -2183,12 +2209,13 @@ function renderOverview() {
       ${latest.futures.length===0?'<div style="color:var(--text3);font-size:12px">Нет открытых позиций</div>':`
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Контракт</th><th>Портфель</th><th>Позиция</th><th>Расч. цена</th><th>Вар. маржа за день</th>
+          <th>Контракт</th><th>Валюта</th><th>Портфель</th><th>Позиция</th><th>Расч. цена</th><th>Вар. маржа за день</th>
         </tr></thead>
         <tbody>${latest.futures.map(f=>{
           const spec=getSpec(f.contract);
           return `<tr>
             <td><span class="badge badge-fut">${f.contract}</span></td>
+            <td class="td-muted td-mono">${spec.currency}</td>
             <td class="td-muted">${f.portfolio}</td>
             <td class="td-mono ${f.outgoing>0?'pos':'neg'}">${f.outgoing>0?'+':''}${f.outgoing}</td>
             <td class="td-mono">${fmt(f.price,3)}</td>
@@ -2404,12 +2431,13 @@ function renderPositions() {
     <div class="section-title">Фьючерсы</div>
     <div class="table-wrap"><table>
       <thead><tr>
-        <th>Контракт</th><th>Портфель</th><th>Входящий</th><th>Исходящий</th><th>Расч. цена</th><th>Вар. маржа</th>
+        <th>Контракт</th><th>Валюта</th><th>Портфель</th><th>Входящий</th><th>Исходящий</th><th>Расч. цена</th><th>Вар. маржа</th>
       </tr></thead>
       <tbody>${latest.futures.map(f=>{
         const spec=getSpec(f.contract);
         return `<tr>
           <td><span class="badge badge-fut">${f.contract}</span></td>
+          <td class="td-muted td-mono">${spec.currency}</td>
           <td class="td-muted">${f.portfolio}</td>
           <td class="td-mono">${f.incoming||'—'}</td>
           <td class="td-mono ${f.outgoing>0?'pos':'neg'}">${f.outgoing?(f.outgoing>0?'+':'')+f.outgoing:'—'}</td>
