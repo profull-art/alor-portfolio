@@ -1435,8 +1435,9 @@ function parseXML(xmlText, filename) {
     // Налоги — проверяем ДО «списания», т.к. «Списание налога» должно идти в tax
     if (opLow.includes('возврат налога')) category = 'tax_return';
     else if (opLow.includes('налог') || noteLow.includes('налог')) category = 'tax';
-    // Дивиденды / купоны
-    else if (opLow.includes('дивиденд') || opLow.includes('купон')) category = 'dividend';
+    // Дивиденды / купоны — разделяем по типу операции
+    else if (opLow.includes('купон')) category = 'coupon';
+    else if (opLow.includes('дивиденд')) category = 'dividend';
     // Комиссия депозитария
     else if (opLow.includes('комиссия депозитария') || opLow.includes('услуг депозитария')) category = 'depositary';
     else if (opLow.includes('зачислен')) {
@@ -2252,6 +2253,135 @@ function donutSVG(segments, size=160, thickness=38) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${paths}</svg>`;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TAX INFO CALCULATION
+// ─────────────────────────────────────────────────────────────────────────────
+function calcTaxInfo() {
+  const mf = allMoneyFlows();
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const prevYear    = currentYear - 1;
+
+  // Парсим год из примечания: "Налог на доходы за 2025 год ..."
+  function yearFromNote(note) {
+    const m = (note||'').match(/за\s+(\d{4})\s+год/i);
+    return m ? parseInt(m[1]) : null;
+  }
+
+  // Является ли строка налогом с дивидендов/купонов?
+  function isDivTax(f) {
+    const n = (f.note||'').toLowerCase();
+    const o = (f.operation||'').toLowerCase();
+    return n.includes('дивиденд') || n.includes('купон') || o.includes('дивиденд') || o.includes('купон');
+  }
+
+  // ── 1. Уплаченный налог текущего года (ЦБ, без дивидендов) ──
+  // Списания налога за currentYear минус возвраты за currentYear
+  let paidCurrentTax = 0;
+  let paidCurrentReturn = 0;
+  mf.forEach(f => {
+    if (isDivTax(f)) return; // дивиденды считаем отдельно
+    const yr = yearFromNote(f.note);
+    // Для tax: учитываем если год в примечании = currentYear ИЛИ примечание пустое/без года (промежуточное)
+    if (f.category === 'tax') {
+      if (yr === currentYear || yr === null) paidCurrentTax += f.amount;
+    }
+    if (f.category === 'tax_return') {
+      if (yr === currentYear || yr === null) paidCurrentReturn += f.amount;
+    }
+  });
+  const netPaidCurrent = paidCurrentTax - paidCurrentReturn;
+
+  // ── 2. Налог с дивидендов/купонов (текущий год) ──
+  let paidDivTax = 0;
+  mf.forEach(f => {
+    if (!isDivTax(f)) return;
+    if (f.category === 'tax' || f.category === 'tax_return') {
+      const yr = yearFromNote(f.note);
+      if (yr === currentYear || yr === null) {
+        paidDivTax += (f.category === 'tax' ? f.amount : -f.amount);
+      }
+    }
+  });
+
+  // ── 3. Налог за прошлый год (только списания, не возвраты) ──
+  let paidPrevYear = 0;
+  mf.forEach(f => {
+    if (f.category !== 'tax') return;
+    const yr = yearFromNote(f.note);
+    if (yr === prevYear) paidPrevYear += f.amount;
+  });
+
+  // ── 4. Расчётный налог от прироста капитала ──
+  // capitalGrowth считается в renderOverview — здесь повторяем ту же логику
+  const latest = getLatest();
+  let capitalGrowth = 0;
+  if (latest) {
+    const totalAbsVal = latest.assets.reduce((s,a)=>s+a.valuation,0);
+    const _filteredReports = getFilteredReports();
+    const _firstReport     = _filteredReports[0];
+    const _firstDate       = _firstReport ? _firstReport.sortDate : '';
+    const _portfolioStart  = _firstReport ? _firstReport.assets.reduce((s,a) => s + a.valuation, 0) : 0;
+    const _mfAfterFirst    = mf.filter(f => f.sortDate > _firstDate);
+    const _deposits        = _mfAfterFirst.filter(f => f.category==='deposit').reduce((s,f) => s+f.amount, 0);
+    const _withdrawals     = _mfAfterFirst.filter(f => f.category==='withdrawal').reduce((s,f) => s+Math.abs(f.amount), 0);
+    const _otherIncome     = _mfAfterFirst.filter(f => f.category==='other'||f.category==='dividend'||f.category==='coupon').reduce((s,f) => s+f.amount, 0);
+    const _base            = _portfolioStart + _deposits - _withdrawals + _otherIncome;
+    capitalGrowth = totalAbsVal - _base;
+  }
+
+  // Прогрессивная ставка: 13% до 2.4 млн, 15% сверх
+  function calcTaxFromBase(base) {
+    if (base <= 0) return 0;
+    const THRESHOLD = 2_400_000;
+    if (base <= THRESHOLD) return base * 0.13;
+    return THRESHOLD * 0.13 + (base - THRESHOLD) * 0.15;
+  }
+
+  const estimatedTax  = calcTaxFromBase(capitalGrowth);
+  const taxDiff       = estimatedTax - netPaidCurrent; // >0 = доплата, <0 = переплата
+
+  // ── Позиции с неполными данными (нет цены открытия) ──
+  // 1. noBuyData — инструменты без сделок на покупку (расчёт невозможен)
+  // 2. inheritedData — унаследованные лоты с частичными сделками (inherited_partial)
+  // 3. inheritedNoTrades — унаследованные позиции без каких-либо сделок в периоде
+  //    (calcPnl их полностью пропускает, но они есть в openPositions первого отчёта)
+  const { noBuyData, list: pnlListTax } = calcPnl();
+
+  const inheritedData = pnlListTax
+    .filter(x => x.status === 'inherited_partial' && x.unmatched > 0)
+    .map(x => ({ name: x.name, type: x.type }));
+
+  // Берём openPositions из самого раннего отчёта — все позиции с ненулевым входящим остатком
+  const inheritedNoTrades = [];
+  const filteredReps = getFilteredReports();
+  if (filteredReps.length > 0) {
+    const earliest = filteredReps[0];
+    for (const [name, qty] of Object.entries(earliest.openPositions || {})) {
+      if (qty !== 0) inheritedNoTrades.push({ name, type: 'stock' });
+    }
+  }
+
+  const seenTaxNames = new Set();
+  const unknownPositions = [...noBuyData, ...inheritedData, ...inheritedNoTrades].filter(x => {
+    if (seenTaxNames.has(x.name)) return false;
+    seenTaxNames.add(x.name); return true;
+  });
+
+  return {
+    netPaidCurrent,    // уплаченный налог текущего года (ЦБ, нетто)
+    paidDivTax,        // налог с дивидендов/купонов
+    paidPrevYear,      // налог за прошлый год
+    estimatedTax,      // расчётный налог от capitalGrowth
+    taxDiff,           // разница (>0 доплата, <0 переплата)
+    capitalGrowth,
+    currentYear,
+    prevYear,
+    noBuyData,
+    unknownPositions,  // все инструменты без полной информации об открытии
+  };
+}
+
 function renderOverview() {
   const latest = getLatest();
   if (!latest) return;
@@ -2371,6 +2501,155 @@ function renderOverview() {
         <div class="card-sub">за загруженный период</div>
       </div>
     </div>
+
+    <!-- ── НАЛОГОВЫЙ БАННЕР ── -->
+    ${(()=>{
+      const tx = calcTaxInfo();
+      const fmt2 = (n) => fmt(Math.abs(n), 0);
+
+      // Карточка 1 — Уплаченный налог (текущий год, ЦБ)
+      const c1Color = tx.netPaidCurrent > 0 ? 'var(--red)' : 'var(--text3)';
+      const c1Val   = tx.netPaidCurrent > 0 ? `−${fmt2(tx.netPaidCurrent)} ₽` : '—';
+
+      // Карточка 2 — Налог с дивидендов/купонов
+      const c2Val   = tx.paidDivTax > 0 ? `−${fmt2(tx.paidDivTax)} ₽` : '—';
+
+      // Карточка 3 — Налог за прошлый год
+      const c3Val   = tx.paidPrevYear > 0 ? `−${fmt2(tx.paidPrevYear)} ₽` : '—';
+
+      // Карточка 4 — К доплате / переплата
+      let c4Label, c4Val, c4Color, c4Icon;
+      if (tx.capitalGrowth <= 0 && tx.netPaidCurrent > 0) {
+        // Прироста нет, но налог уже уплачен — вся уплаченная сумма является переплатой
+        c4Label = 'Возникла переплата по налогам';
+        c4Val   = `${fmt2(tx.netPaidCurrent)} ₽`;
+        c4Color = 'var(--green)';
+        c4Icon  = '↓';
+      } else if (tx.capitalGrowth <= 0) {
+        c4Label = 'Налог не начисляется';
+        c4Val   = 'прироста нет';
+        c4Color = 'var(--text3)';
+        c4Icon  = '○';
+      } else if (Math.abs(tx.taxDiff) < 1) {
+        c4Label = 'Налог уплачен полностью';
+        c4Val   = '0 ₽';
+        c4Color = 'var(--green)';
+        c4Icon  = '✓';
+      } else if (tx.taxDiff > 0) {
+        c4Label = 'Ориентировочно к доплате';
+        c4Val   = `+${fmt2(tx.taxDiff)} ₽`;
+        c4Color = 'var(--red)';
+        c4Icon  = '↑';
+      } else {
+        c4Label = 'Ориентировочная переплата';
+        c4Val   = `${fmt2(tx.taxDiff)} ₽`;
+        c4Color = 'var(--green)';
+        c4Icon  = '↓';
+      }
+
+      // Строка под баннером: предупреждение об инструментах без полной информации
+      const inheritedWarn = tx.unknownPositions.length > 0
+        ? `<div style="display:flex;align-items:flex-start;gap:10px;margin-top:10px;padding:10px 14px;
+            background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.2);
+            border-radius:var(--radius-sm);font-size:12px;color:var(--amber);line-height:1.6">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              style="width:14px;height:14px;flex-shrink:0;margin-top:1px">
+              <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+              <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+            <div>
+              <strong>Расчёт налога некорректен:</strong> по следующим инструментам отсутствует информация о цене и дате открытия позиций —
+              ${tx.unknownPositions.map(x=>`<strong>${x.name}</strong>`).join(', ')}.
+              Вероятно, позиции были открыты до начала загруженного периода отчётов.
+              Эти инструменты <strong>не включены</strong> в расчёт ориентировочного налога — фактический результат может отличаться.
+              Загрузите отчёты за более ранние периоды для точного расчёта.
+            </div>
+          </div>`
+        : '';
+
+      // Подпись ставки
+      const rateNote = tx.capitalGrowth <= 0
+        ? 'Стоимость портфеля снизилась'
+        : tx.capitalGrowth > 2_400_000
+          ? '13% до 2.4 млн + 15% сверх'
+          : '13% от прироста капитала';
+
+      return `
+      <div class="section-title" style="margin-top:4px;margin-bottom:10px">Информация по налогам (на основе предоставленных отчётов)</div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:${tx.unknownPositions.length>0?'0':'20px'}">
+
+        <!-- Карточка 1: Уплаченный налог текущего года -->
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px">
+          <div style="font-size:10px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:8px">
+            Уплачено налога · ${tx.currentYear} г.
+          </div>
+          <div style="font-size:20px;font-weight:700;font-family:var(--mono);color:${c1Color};line-height:1.2;margin-bottom:4px">
+            ${c1Val}
+          </div>
+          <div style="font-size:11px;color:var(--text3);line-height:1.5">
+            от операций с ЦБ<br>нетто (за вычетом возвратов)
+          </div>
+        </div>
+
+        <!-- Карточка 2: Налог с дивидендов/купонов -->
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px">
+          <div style="font-size:10px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:8px">
+            Налог с дивидендов/купонов
+          </div>
+          <div style="font-size:20px;font-weight:700;font-family:var(--mono);color:${tx.paidDivTax>0?'var(--red)':'var(--text3)'};line-height:1.2;margin-bottom:4px">
+            ${c2Val}
+          </div>
+          <div style="font-size:11px;color:var(--text3);line-height:1.5">
+            удержан брокером<br>текущий год
+          </div>
+        </div>
+
+        <!-- Карточка 3: Налог за прошлый год -->
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px">
+          <div style="font-size:10px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:8px">
+            Налог за ${tx.prevYear} г.
+          </div>
+          <div style="font-size:20px;font-weight:700;font-family:var(--mono);color:${tx.paidPrevYear>0?'var(--amber)':'var(--text3)'};line-height:1.2;margin-bottom:4px">
+            ${c3Val}
+          </div>
+          <div style="font-size:11px;color:var(--text3);line-height:1.5">
+            списание в начале года<br>за прошлый период
+          </div>
+        </div>
+
+        <!-- Карточка 4: К доплате / Переплата -->
+        <div style="background:var(--bg3);border:1px solid ${c4Color}22;border-radius:var(--radius);padding:16px 18px;position:relative;overflow:hidden">
+          <div style="position:absolute;top:10px;right:14px;font-size:22px;opacity:0.12;font-weight:900;color:${c4Color}">${c4Icon}</div>
+          <div style="font-size:10px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:8px">
+            ${c4Label}
+          </div>
+          <div style="font-size:20px;font-weight:700;font-family:var(--mono);color:${c4Color};line-height:1.2;margin-bottom:4px">
+            ${c4Val}
+          </div>
+          <div style="font-size:11px;color:var(--text3);line-height:1.5">
+            ${rateNote}<br>
+            база: прирост капитала ${tx.capitalGrowth>=0?'+':'−'}${fmt2(tx.capitalGrowth)} ₽
+          </div>
+        </div>
+
+      </div>
+      ${inheritedWarn}
+      ${tx.unknownPositions.length>0?'<div style="margin-bottom:8px"></div>':''}
+      <div style="display:flex;align-items:flex-start;gap:10px;margin-top:10px;margin-bottom:20px;padding:10px 14px;
+          background:var(--bg4);border:1px solid var(--border);
+          border-radius:var(--radius-sm);font-size:12px;color:var(--text3);line-height:1.6">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          style="width:14px;height:14px;flex-shrink:0;margin-top:1px;color:var(--text3)">
+          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <div>
+          <strong style="color:var(--text2)">Важно:</strong> данный расчёт является очень приблизительным и носит исключительно информационный характер.
+          Для получения точных сведений о налоговой базе и сумме налога к уплате рекомендуем заказать официальный расчёт налога
+          в личном кабинете клиента АЛОР БРОКЕР.
+        </div>
+      </div>
+      `;
+    })()}
 
     <!-- Основная сетка: PnL слева, правая колонка -->
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px">
@@ -3355,6 +3634,7 @@ function renderMoney() {
   const taxes       = flows.filter(f => f.category === 'tax');
   const taxReturns  = flows.filter(f => f.category === 'tax_return');
   const dividends   = flows.filter(f => f.category === 'dividend');
+  const coupons     = flows.filter(f => f.category === 'coupon');
   const incomes     = flows.filter(f => f.category === 'income');
   const fees        = flows.filter(f => f.category === 'fee');
   const others      = flows.filter(f => f.category === 'other');
@@ -3364,10 +3644,29 @@ function renderMoney() {
   const totalTax        = taxes.reduce((s,f) => s + f.amount, 0);
   const totalTaxReturn  = taxReturns.reduce((s,f) => s + f.amount, 0);
   const totalDividends  = dividends.reduce((s,f) => s + f.amount, 0);
+  const totalCoupons    = coupons.reduce((s,f) => s + f.amount, 0);
   const totalIncome     = incomes.reduce((s,f) => s + f.amount, 0);
   const totalFees       = fees.reduce((s,f) => s + f.amount, 0);
   const netTax          = totalTax - totalTaxReturn;
-  const netFlow         = totalDeposit - totalWithdrawal - netTax + totalIncome + totalDividends;
+  const netFlow         = totalDeposit - totalWithdrawal - netTax + totalIncome + totalDividends + totalCoupons;
+
+  // Разбивка налогов по годам
+  const currentYear = new Date().getFullYear().toString();
+  const prevYear    = (new Date().getFullYear() - 1).toString();
+
+  const taxesCurYear   = taxes.filter(f => (f.sortDate || '').startsWith(currentYear));
+  const taxRetCurYear  = taxReturns.filter(f => (f.sortDate || '').startsWith(currentYear));
+  const taxesPrevYear  = taxes.filter(f => (f.sortDate || '').startsWith(prevYear));
+  const taxRetPrevYear = taxReturns.filter(f => (f.sortDate || '').startsWith(prevYear));
+
+  const totalTaxCur    = taxesCurYear.reduce((s,f) => s + f.amount, 0);
+  const totalTaxRetCur = taxRetCurYear.reduce((s,f) => s + f.amount, 0);
+  const netTaxCur      = totalTaxCur - totalTaxRetCur;
+
+  const totalTaxPrev    = taxesPrevYear.reduce((s,f) => s + f.amount, 0);
+  const totalTaxRetPrev = taxRetPrevYear.reduce((s,f) => s + f.amount, 0);
+  const netTaxPrev      = totalTaxPrev - totalTaxRetPrev;
+  const hasPrevYearTax  = totalTaxPrev > 0 || totalTaxRetPrev > 0;
 
   function catBadge(cat) {
     const map = {
@@ -3377,6 +3676,7 @@ function renderMoney() {
       tax:        ['badge-partial', 'Налог'],
       tax_return: ['badge-long',    'Возврат налога'],
       dividend:   ['badge-usd',     'Дивиденды'],
+      coupon:     ['badge-usd',     'Купон'],
       income:     ['badge-usd',     'Поступление'],
       fee:        ['badge-fut',     'Комиссия'],
       other:      ['badge-closed',  'Прочее'],
@@ -3386,7 +3686,7 @@ function renderMoney() {
   }
 
   function amountDisplay(f) {
-    const isPositive = f.category === 'deposit' || f.category === 'tax_return' || f.category === 'income' || f.category === 'dividend';
+    const isPositive = f.category === 'deposit' || f.category === 'tax_return' || f.category === 'income' || f.category === 'dividend' || f.category === 'coupon';
     const isNegative = f.category === 'withdrawal' || f.category === 'tax' || f.category === 'fee';
     const color = isPositive ? 'var(--green)' : isNegative ? 'var(--red)' : 'var(--text)';
     const sign  = isPositive ? '+' : isNegative ? '−' : '';
@@ -3425,7 +3725,8 @@ function renderMoney() {
     { label: 'Внутренние переводы',   rows: transfers,   sign: '±', color: 'var(--text2)' },
     { label: 'Налоги',               rows: taxes,       sign: '−', color: 'var(--red)'   },
     { label: 'Возвраты налогов',      rows: taxReturns,  sign: '+', color: 'var(--green)' },
-    { label: 'Дивиденды / Купоны',   rows: dividends,   sign: '+', color: 'var(--teal)'  },
+    { label: 'Дивиденды',            rows: dividends,   sign: '+', color: 'var(--teal)'  },
+    { label: 'Купоны',               rows: coupons,     sign: '+', color: 'var(--teal)'  },
     { label: 'Поступления прочие',    rows: incomes,     sign: '+', color: 'var(--teal)'  },
     { label: 'Прочее',               rows: others,      sign: '',  color: 'var(--text3)' },
   ].filter(s => s.rows.length > 0);
@@ -3446,14 +3747,24 @@ function renderMoney() {
         <div class="card-sub">${withdrawals.length} операций</div>
       </div>
       <div class="card">
-        <div class="card-label">Налоги (нетто)</div>
-        <div class="card-value td-mono ${netTax >= 0 ? 'neg' : 'pos'}">${netTax >= 0 ? '−' : '+'}${fmt(Math.abs(netTax), 0)} <small style="font-size:14px">₽</small></div>
-        <div class="card-sub">списано ${fmt(totalTax, 0)} ₽${totalTaxReturn > 0 ? ` · возврат ${fmt(totalTaxReturn, 0)} ₽` : ''}</div>
+        <div class="card-label">Налоги (нетто) <span style="font-size:10px;background:rgba(212,168,67,0.13);color:var(--gold);border:1px solid rgba(212,168,67,0.25);border-radius:6px;padding:1px 6px;margin-left:4px;font-family:var(--mono);letter-spacing:0.03em">${currentYear}</span></div>
+        <div class="card-value td-mono ${netTaxCur >= 0 ? 'neg' : 'pos'}">${netTaxCur >= 0 ? '−' : '+'}${fmt(Math.abs(netTaxCur), 0)} <small style="font-size:14px">₽</small></div>
+        <div class="card-sub">списано ${fmt(totalTaxCur, 0)} ₽${totalTaxRetCur > 0 ? ` · возврат ${fmt(totalTaxRetCur, 0)} ₽` : ''}</div>
       </div>
+      ${hasPrevYearTax ? `<div class="card">
+        <div class="card-label">Налоги (нетто) <span style="font-size:10px;background:rgba(139,92,246,0.13);color:var(--purple);border:1px solid rgba(139,92,246,0.25);border-radius:6px;padding:1px 6px;margin-left:4px;font-family:var(--mono);letter-spacing:0.03em">${prevYear}</span></div>
+        <div class="card-value td-mono ${netTaxPrev >= 0 ? 'neg' : 'pos'}">${netTaxPrev >= 0 ? '−' : '+'}${fmt(Math.abs(netTaxPrev), 0)} <small style="font-size:14px">₽</small></div>
+        <div class="card-sub">списано ${fmt(totalTaxPrev, 0)} ₽${totalTaxRetPrev > 0 ? ` · возврат ${fmt(totalTaxRetPrev, 0)} ₽` : ''}</div>
+      </div>` : ''}
       ${totalDividends > 0 ? `<div class="card">
-        <div class="card-label">Дивиденды / Купоны</div>
+        <div class="card-label">Дивиденды</div>
         <div class="card-value td-mono" style="color:var(--teal)">+${fmt(totalDividends, 2)} <small style="font-size:14px">₽</small></div>
         <div class="card-sub">${dividends.length} начислений</div>
+      </div>` : ''}
+      ${totalCoupons > 0 ? `<div class="card">
+        <div class="card-label">Купоны</div>
+        <div class="card-value td-mono" style="color:var(--teal)">+${fmt(totalCoupons, 2)} <small style="font-size:14px">₽</small></div>
+        <div class="card-sub">${coupons.length} начислений</div>
       </div>` : ''}
       ${totalIncome > 0 ? `<div class="card">
         <div class="card-label">Поступления прочие</div>
@@ -3463,15 +3774,16 @@ function renderMoney() {
       <div class="card ${netFlow >= 0 ? 'card-gold' : ''}">
         <div class="card-label">Чистый приток</div>
         <div class="card-value td-mono ${netFlow >= 0 ? '' : 'neg'}">${netFlow >= 0 ? '+' : '−'}${fmt(Math.abs(netFlow), 0)} <small style="font-size:14px">₽</small></div>
-        <div class="card-sub">пополнения + дивиденды + прочие − выводы − налоги</div>
+        <div class="card-sub">пополнения + дивиденды + купоны + прочие − выводы − налоги</div>
       </div>
     </div>
 
     <!-- Визуальная полоска структуры -->
-    ${(totalDeposit + totalWithdrawal + Math.abs(netTax) + totalIncome + totalDividends) > 0 ? (() => {
-      const total = totalDeposit + totalWithdrawal + Math.abs(netTax) + totalIncome + totalDividends;
+    ${(totalDeposit + totalWithdrawal + Math.abs(netTax) + totalIncome + totalDividends + totalCoupons) > 0 ? (() => {
+      const total = totalDeposit + totalWithdrawal + Math.abs(netTax) + totalIncome + totalDividends + totalCoupons;
       const pDep  = totalDeposit / total * 100;
       const pDiv  = totalDividends / total * 100;
+      const pCou  = totalCoupons / total * 100;
       const pInc  = totalIncome  / total * 100;
       const pWith = totalWithdrawal / total * 100;
       const pTax  = Math.abs(netTax) / total * 100;
@@ -3479,6 +3791,7 @@ function renderMoney() {
         <div style="display:flex;height:8px;border-radius:6px;overflow:hidden;gap:2px;margin-bottom:10px">
           ${pDep  > 0 ? `<div style="flex:${pDep};background:var(--green);border-radius:4px;min-width:2px"></div>` : ''}
           ${pDiv  > 0 ? `<div style="flex:${pDiv};background:var(--teal);border-radius:4px;min-width:2px"></div>` : ''}
+          ${pCou  > 0 ? `<div style="flex:${pCou};background:#5eead4;border-radius:4px;min-width:2px"></div>` : ''}
           ${pInc  > 0 ? `<div style="flex:${pInc};background:#22d3ee;border-radius:4px;min-width:2px"></div>` : ''}
           ${pWith > 0 ? `<div style="flex:${pWith};background:var(--red);border-radius:4px;min-width:2px"></div>` : ''}
           ${pTax  > 0 ? `<div style="flex:${pTax};background:var(--amber);border-radius:4px;min-width:2px"></div>` : ''}
@@ -3486,6 +3799,7 @@ function renderMoney() {
         <div style="display:flex;gap:20px;font-size:12px;color:var(--text3);flex-wrap:wrap">
           ${pDep  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--green);margin-right:5px;vertical-align:middle"></span>Пополнения ${fmt(pDep,1)}%</span>` : ''}
           ${pDiv  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--teal);margin-right:5px;vertical-align:middle"></span>Дивиденды ${fmt(pDiv,1)}%</span>` : ''}
+          ${pCou  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#5eead4;margin-right:5px;vertical-align:middle"></span>Купоны ${fmt(pCou,1)}%</span>` : ''}
           ${pInc  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#22d3ee;margin-right:5px;vertical-align:middle"></span>Поступления прочие ${fmt(pInc,1)}%</span>` : ''}
           ${pWith > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--red);margin-right:5px;vertical-align:middle"></span>Выводы ${fmt(pWith,1)}%</span>` : ''}
           ${pTax  > 0 ? `<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--amber);margin-right:5px;vertical-align:middle"></span>Налоги ${fmt(pTax,1)}%</span>` : ''}
@@ -3843,7 +4157,7 @@ function renderHelp() {
               <svg viewBox="0 0 24 24" fill="none" stroke="var(--teal)" stroke-width="2" style="width:18px;height:18px;flex-shrink:0;margin-top:1px"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/><line x1="12" y1="12" x2="12" y2="16"/><line x1="10" y1="14" x2="14" y2="14"/></svg>
               <div style="flex:1">
                 <div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:3px">Движение денег</div>
-                <div style="font-size:12px;color:var(--text2);line-height:1.6">Все денежные операции по счёту: пополнения, выводы, налоги (с учётом возвратов), дивиденды и купоны, прочие поступления и комиссии. Расчёт чистого притока денег, визуальная структура потоков и детализация по каждой категории.</div>
+                <div style="font-size:12px;color:var(--text2);line-height:1.6">Все денежные операции по счёту: пополнения, выводы, налоги (с учётом возвратов), дивиденды, купоны, прочие поступления и комиссии. Расчёт чистого притока денег, визуальная структура потоков и детализация по каждой категории.</div>
               </div>
             </div>
 
