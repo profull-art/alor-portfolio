@@ -810,70 +810,164 @@ select:hover, select:focus { border-color:var(--gold); box-shadow: 0 0 0 3px rgb
 // Встроенный словарь по префиксам — fallback для истёкших контрактов и офлайн-режима.
 // Автоматически дополняется данными МосБиржи (ISS API) при загрузке отчёта.
 // ─────────────────────────────────────────────────────────────────────────────
+// CONTRACT_SPECS — сгенерировано с МосБиржи ISS
+// Дата: 16.04.2026, 14:15:01
+// Активных фьючерсов: 420, уникальных префиксов: 146
+//
+// pointValue = STEPPRICE/MINSTEP — стоимость пункта в рублях на текущую дату.
+//              Используется только как ФОЛБЭК для рублёвых контрактов (pointUsd отсутствует).
+// pointUsd   = стоимость пункта в USD — КОНСТАНТА биржи, не зависит от курса.
+//              Если задан, PnL считается как: delta × pointUsd × usdRate_на_дату_сделки
+//              Это даёт точный результат независимо от текущего курса.
+// asset      = поле ASSET из ISS (именно это АЛОР пишет в поле «Контракт» отчёта)
 const CONTRACT_SPECS = {
-  // ── Товарные (USD) ──────────────────────────────────────────────────────────
-  'BR':      { currency:'USD', pointValue:10.0,  name:'Нефть Brent'         },
-  'NG':      { currency:'USD', pointValue:10.0,  name:'Природный газ'       },
-  'GD':      { currency:'USD', pointValue:1.0,   name:'Золото (USD)'        },
-  'GOLD':    { currency:'USD', pointValue:1.0,   name:'Золото (USD)'        },
-  'PL':      { currency:'USD', pointValue:1.0,   name:'Платина'             },
-  'PA':      { currency:'USD', pointValue:1.0,   name:'Палладий'            },
-  'CU':      { currency:'USD', pointValue:1.0,   name:'Медь'                },
-  'AL':      { currency:'USD', pointValue:1.0,   name:'Алюминий'            },
-  'Co':      { currency:'USD', pointValue:1.0,   name:'Кобальт'             },
-  // ── Индексы (USD) ───────────────────────────────────────────────────────────
-  'RTS':     { currency:'USD', pointValue:0.02,  name:'Индекс РТС'          },
-  'RI':      { currency:'USD', pointValue:0.02,  name:'Индекс РТС (мини)'   },
-  // ── Индексы (RUB) ───────────────────────────────────────────────────────────
-  'MX':      { currency:'RUB', pointValue:1.0,   name:'Индекс МосБиржи'     },
-  'MXI':     { currency:'RUB', pointValue:1.0,   name:'Индекс МосБиржи мини'},
-  'IMOEXF':  { currency:'RUB', pointValue:5.0,   name:'Индекс МосБиржи (фьюч.)'},
-  // ── Валюта (RUB) ────────────────────────────────────────────────────────────
-  'Si':      { currency:'RUB', pointValue:1.0,   name:'USD/RUB'             },
-  'ED':      { currency:'RUB', pointValue:1.0,   name:'EUR/USD'             },
-  'Eu':      { currency:'RUB', pointValue:1.0,   name:'EUR/RUB'             },
-  'CNYRUB':  { currency:'RUB', pointValue:1.0,   name:'CNY/RUB'             },
-  'CY':      { currency:'RUB', pointValue:1.0,   name:'CNY/RUB'             },
-  // ── Золото в рублях ─────────────────────────────────────────────────────────
-  'GLDRUBF': { currency:'RUB', pointValue:1.0,   name:'Золото (RUB)'        },
-  'GLD':     { currency:'RUB', pointValue:1.0,   name:'Золото (RUB)'        },
-  // ── Акции (RUB) — pointValue всегда 1.0 ────────────────────────────────────
-  'SR':      { currency:'RUB', pointValue:1.0,   name:'Сбербанк'            },
-  'GZ':      { currency:'RUB', pointValue:1.0,   name:'Газпром'             },
-  'LK':      { currency:'RUB', pointValue:1.0,   name:'Лукойл'              },
-  'GM':      { currency:'RUB', pointValue:1.0,   name:'ГМК НорНикель'       },
-  'VB':      { currency:'RUB', pointValue:1.0,   name:'ВТБ'                 },
-  'TT':      { currency:'RUB', pointValue:1.0,   name:'Татнефть'            },
-  'MG':      { currency:'RUB', pointValue:1.0,   name:'Магнит'              },
-  'YN':      { currency:'RUB', pointValue:1.0,   name:'Яндекс'              },
-  'RN':      { currency:'RUB', pointValue:1.0,   name:'Роснефть'            },
-  'NK':      { currency:'RUB', pointValue:1.0,   name:'НЛМК'                },
-  'MT':      { currency:'RUB', pointValue:1.0,   name:'МТС'                 },
-  'MN':      { currency:'RUB', pointValue:1.0,   name:'ММК'                 },
-  'CH':      { currency:'RUB', pointValue:1.0,   name:'ЧМК'                 },
-  'NM':      { currency:'RUB', pointValue:1.0,   name:'Норникель мини'      },
-  'AF':      { currency:'RUB', pointValue:1.0,   name:'Аэрофлот'            },
-  'NU':      { currency:'RUB', pointValue:1.0,   name:'Новатэк'             },
-  'PO':      { currency:'RUB', pointValue:1.0,   name:'Полюс'               },
-  'SG':      { currency:'RUB', pointValue:1.0,   name:'Сегежа'              },
-  'TR':      { currency:'RUB', pointValue:1.0,   name:'Татнефть прив.'      },
-  'HY':      { currency:'RUB', pointValue:1.0,   name:'HeadHunter'          },
-  'FV':      { currency:'RUB', pointValue:1.0,   name:'ФосАгро'             },
-  'TN':      { currency:'RUB', pointValue:1.0,   name:'Транснефть'          },
-  'IM':      { currency:'RUB', pointValue:1.0,   name:'Интер РАО'           },
-  'ME':      { currency:'RUB', pointValue:1.0,   name:'Мосэнерго'           },
-  'RU':      { currency:'RUB', pointValue:1.0,   name:'РусГидро'            },
-  'SL':      { currency:'RUB', pointValue:1.0,   name:'СберПреф'            },
-  'OZ':      { currency:'RUB', pointValue:1.0,   name:'Озон'                },
-  'SP':      { currency:'RUB', pointValue:1.0,   name:'Сургутнефтегаз прив.'},
-  'SN':      { currency:'RUB', pointValue:1.0,   name:'Сургутнефтегаз'      },
-  'TZ':      { currency:'RUB', pointValue:1.0,   name:'ТКС Холдинг'         },
-  'WM':      { currency:'RUB', pointValue:1.0,   name:'ВК'                  },
-  // ── Облигации / ставки (RUB) ────────────────────────────────────────────────
-  'OF':      { currency:'RUB', pointValue:1.0,   name:'ОФЗ'                 },
-  'OFZ':     { currency:'RUB', pointValue:1.0,   name:'ОФЗ'                 },
-  'RUONIA':  { currency:'RUB', pointValue:1.0,   name:'RUONIA'              },
-  'MOEXREPO':{ currency:'RUB', pointValue:1.0,   name:'MOEX REPO'           },
+  // ── RUB (146) ─────────────────────────────────────────────────────────────
+  'AA':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'AFRICA'   },  // AAM6
+  'AE':  { currency:'RUB', pointValue:1000,                        asset:'AED'      },  // AEM6
+  'AF':  { currency:'RUB', pointValue:1,                           asset:'AFLT'     },  // AFM6
+  'AG':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'ARGT'     },  // AGM6
+  'AK':  { currency:'RUB', pointValue:1,                           asset:'AFKS'     },  // AKM6
+  'AL':  { currency:'RUB', pointValue:1,                           asset:'ALRS'     },  // ALM6
+  'AN':  { currency:'RUB', pointValue:7.52346,                     asset:'ALUM'     },  // ANM6
+  'AR':  { currency:'RUB', pointValue:1000,                        asset:'AMD'      },  // ARM6
+  'AS':  { currency:'RUB', pointValue:1,                           asset:'ASTR'     },  // ASM6
+  'AU':  { currency:'RUB', pointValue:75234.6,                     asset:'AUDU'     },  // AUM6
+  'BB':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'ALIBABA'  },  // BBM6
+  'BD':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'BAIDU'    },  // BDM6
+  'BM':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'BRM'      },  // BMK6
+  'BN':  { currency:'RUB', pointValue:1,                           asset:'BANE'     },  // BNM6
+  'BR':  { currency:'USD', pointValue:752.346,   pointUsd:10,      asset:'BR'       },  // BRK6
+  'BS':  { currency:'RUB', pointValue:1,                           asset:'BSPB'     },  // BSM6
+  'BT':  { currency:'USD', pointValue:0.07523,   pointUsd:0.001,   asset:'BTC'      },  // BTJ6
+  'BY':  { currency:'RUB', pointValue:1000,                        asset:'BYN'      },  // BYM6
+  'BZ':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'BRAZIL'   },  // BZM6
+  'CA':  { currency:'RUB', pointValue:54688.2,                     asset:'UCAD'     },  // CAM6
+  'CC':  { currency:'RUB', pointValue:10,                          asset:'COCOA'    },  // CCJ6
+  'CE':  { currency:'RUB', pointValue:0.75235,                     asset:'COPPER'   },  // CEM6
+  'CF':  { currency:'RUB', pointValue:96343.4,                     asset:'UCHF'     },  // CFM6
+  'CH':  { currency:'RUB', pointValue:1,                           asset:'CHMF'     },  // CHM6
+  'CI':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'CHINA'    },  // CIM6
+  'CK':  { currency:'RUB', pointValue:1,                           asset:'CHMFM'    },  // CKM6
+  'CM':  { currency:'RUB', pointValue:1,                           asset:'CBOM'     },  // CMM6
+  'CR':  { currency:'RUB', pointValue:1000,                        asset:'CNY'      },  // CRH7
+  'CS':  { currency:'RUB', pointValue:1,                           asset:'CNI'      },  // CSM6
+  'DJ':  { currency:'USD', pointValue:75.2346,   pointUsd:1,       asset:'DJ30'     },  // DJM6
+  'DR':  { currency:'RUB', pointValue:1,                           asset:'DOMRF'    },  // DRM6
+  'DX':  { currency:'RUB', pointValue:0.8873,                      asset:'DAX'      },  // DXM6
+  'EA':  { currency:'RUB', pointValue:1,                           asset:'ENPG'     },  // EAM6
+  'EC':  { currency:'RUB', pointValue:54688.2,                     asset:'ECAD'     },  // ECM6
+  'ED':  { currency:'RUB', pointValue:75234.6,                     asset:'ED'       },  // EDH7
+  'EG':  { currency:'RUB', pointValue:102228.8,                    asset:'EGBP'     },  // EGM6
+  'EH':  { currency:'USD', pointValue:0.7523,    pointUsd:0.01,    asset:'ETH'      },  // EHJ6
+  'EJ':  { currency:'RUB', pointValue:473.56,                      asset:'EJPY'     },  // EJM6
+  'EM':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'EM'       },  // EMM6
+  'ET':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'ETHA'     },  // ETM6
+  'Eu':  { currency:'RUB', pointValue:1,                           asset:'EU'       },  // EuH7
+  'FE':  { currency:'RUB', pointValue:1,                           asset:'FESH'     },  // FEM6
+  'FF':  { currency:'RUB', pointValue:88.73,                       asset:'TTF'      },  // FFJ6
+  'FL':  { currency:'RUB', pointValue:1,                           asset:'FLOT'     },  // FLM6
+  'FN':  { currency:'RUB', pointValue:1,                           asset:'FNI'      },  // FNM6
+  'FS':  { currency:'RUB', pointValue:1,                           asset:'FEES'     },  // FSM6
+  'GD':  { currency:'USD', pointValue:75.2346,   pointUsd:1,       asset:'GOLD'     },  // GDH7
+  'GK':  { currency:'RUB', pointValue:1,                           asset:'GMKN'     },  // GKM6
+  'GL':  { currency:'RUB', pointValue:1,                           asset:'GL'       },  // GLH7
+  'GN':  { currency:'USD', pointValue:7.5235,    pointUsd:0.1,     asset:'GOLDM'    },  // GNH7
+  'GU':  { currency:'RUB', pointValue:75234.6,                     asset:'GBPU'     },  // GUM6
+  'GZ':  { currency:'RUB', pointValue:1,                           asset:'GAZR'     },  // GZH7
+  'HD':  { currency:'RUB', pointValue:1,                           asset:'HEAD'     },  // HDM6
+  'HK':  { currency:'RUB', pointValue:1000,                        asset:'HKD'      },  // HKM6
+  'HO':  { currency:'RUB', pointValue:1,                           asset:'HOME'     },  // HOM6
+  'HS':  { currency:'RUB', pointValue:0.09621,                     asset:'HANG'     },  // HSM6
+  'HY':  { currency:'RUB', pointValue:1,                           asset:'HYDR'     },  // HYM6
+  'IB':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'IBIT'     },  // IBM6
+  'IP':  { currency:'RUB', pointValue:1,                           asset:'IPO'      },  // IPM6
+  'IR':  { currency:'RUB', pointValue:1,                           asset:'IRAO'     },  // IRM6
+  'IS':  { currency:'RUB', pointValue:1,                           asset:'ISKJ'     },  // ISM6
+  'IV':  { currency:'RUB', pointValue:1,                           asset:'IVAT'     },  // IVM6
+  'JP':  { currency:'RUB', pointValue:473.56,                      asset:'UJPY'     },  // JPM6
+  'KC':  { currency:'USD', pointValue:752.35,    pointUsd:10,      asset:'COFFEE'   },  // KCJ6
+  'KM':  { currency:'RUB', pointValue:1,                           asset:'KMAZ'     },  // KMM6
+  'KZ':  { currency:'RUB', pointValue:1000,                        asset:'KZT'      },  // KZM6
+  'LD':  { currency:'USD', pointValue:7.5235,    pointUsd:0.1,     asset:'PLDM'     },  // LDH7
+  'LE':  { currency:'RUB', pointValue:1,                           asset:'LEAS'     },  // LEM6
+  'LK':  { currency:'RUB', pointValue:1,                           asset:'LKOH'     },  // LKH7
+  'LT':  { currency:'USD', pointValue:7.5235,    pointUsd:0.1,     asset:'PLTM'     },  // LTH7
+  'MA':  { currency:'RUB', pointValue:1,                           asset:'MMI'      },  // MAM6
+  'MC':  { currency:'RUB', pointValue:1,                           asset:'MTLR'     },  // MCM6
+  'MD':  { currency:'RUB', pointValue:1,                           asset:'MDMG'     },  // MDM6
+  'ME':  { currency:'RUB', pointValue:1,                           asset:'MOEX'     },  // MEM6
+  'MF':  { currency:'RUB', pointValue:821.918,                     asset:'1MFR'     },  // MFJ6
+  'MG':  { currency:'RUB', pointValue:1,                           asset:'MAGN'     },  // MGM6
+  'MM':  { currency:'RUB', pointValue:10,                          asset:'MXI'      },  // MMH7
+  'MN':  { currency:'RUB', pointValue:1,                           asset:'MGNT'     },  // MNM6
+  'MT':  { currency:'RUB', pointValue:1,                           asset:'MTSI'     },  // MTM6
+  'MV':  { currency:'RUB', pointValue:1,                           asset:'MVID'     },  // MVM6
+  'MX':  { currency:'RUB', pointValue:1,                           asset:'MIX'      },  // MXH7
+  'MY':  { currency:'RUB', pointValue:11.0895,                     asset:'MOEXCNY'  },  // MYM6
+  'NA':  { currency:'USD', pointValue:0.75235,   pointUsd:0.01,    asset:'NASD'     },  // NAH7
+  'NB':  { currency:'RUB', pointValue:1,                           asset:'BELUGA'   },  // NBM6
+  'NC':  { currency:'RUB', pointValue:0.752346,                    asset:'NICKEL'   },  // NCM6
+  'ND':  { currency:'USD', pointValue:752.35,    pointUsd:10,      asset:'INDIA'    },  // NDM6
+  'NG':  { currency:'USD', pointValue:7523.46,   pointUsd:100,     asset:'NG'       },  // NGJ6
+  'NM':  { currency:'RUB', pointValue:1,                           asset:'NLMK'     },  // NMM6
+  'NR':  { currency:'USD', pointValue:75.23,     pointUsd:1,       asset:'NGM'      },  // NRJ6
+  'NV':  { currency:'RUB', pointValue:1,                           asset:'NOTKM'    },  // NVM6
+  'OG':  { currency:'RUB', pointValue:1,                           asset:'OGI'      },  // OGM6
+  'OJ':  { currency:'RUB', pointValue:7523.46,                     asset:'ORANGE'   },  // OJK6
+  'ON':  { currency:'RUB', pointValue:1,                           asset:'OZON'     },  // ONM6
+  'PD':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'PLD'      },  // PDH7
+  'PH':  { currency:'RUB', pointValue:1,                           asset:'PHOR'     },  // PHM6
+  'PI':  { currency:'RUB', pointValue:1,                           asset:'PIKK'     },  // PIM6
+  'PS':  { currency:'RUB', pointValue:1,                           asset:'POSI'     },  // PSM6
+  'PT':  { currency:'USD', pointValue:75.2346,   pointUsd:1,       asset:'PLT'      },  // PTH7
+  'PX':  { currency:'RUB', pointValue:1,                           asset:'PLZLM'    },  // PXM6
+  'RA':  { currency:'RUB', pointValue:1,                           asset:'RASP'     },  // RAM6
+  'RB':  { currency:'RUB', pointValue:1,                           asset:'RGBI'     },  // RBH7
+  'RD':  { currency:'RUB', pointValue:1,                           asset:'RENI'     },  // RDM6
+  'RI':  { currency:'USD', pointValue:1.504692,  pointUsd:0.02,    asset:'RTS'      },  // RIH7
+  'RL':  { currency:'RUB', pointValue:1,                           asset:'RUAL'     },  // RLM6
+  'RM':  { currency:'USD', pointValue:15.04692,  pointUsd:0.2,     asset:'RTSM'     },  // RMM6
+  'RN':  { currency:'RUB', pointValue:1,                           asset:'ROSN'     },  // RNM6
+  'RQ':  { currency:'RUB', pointValue:1,                           asset:'RTKMP'    },  // RQM6
+  'RR':  { currency:'RUB', pointValue:821.918,                     asset:'RUON'     },  // RRJ6
+  'RT':  { currency:'RUB', pointValue:1,                           asset:'RTKM'     },  // RTM6
+  'RU':  { currency:'RUB', pointValue:1,                           asset:'RNFT'     },  // RUM6
+  'SA':  { currency:'RUB', pointValue:1016,                        asset:'SUGR'     },  // SAK6
+  'SC':  { currency:'RUB', pointValue:1,                           asset:'SVCB'     },  // SCM6
+  'SD':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'SAUDI'    },  // SDM6
+  'SE':  { currency:'RUB', pointValue:1,                           asset:'SPBE'     },  // SEM6
+  'SF':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'SPYF'     },  // SFH7
+  'SG':  { currency:'RUB', pointValue:1,                           asset:'SNGP'     },  // SGM6
+  'SH':  { currency:'RUB', pointValue:1,                           asset:'SFIN'     },  // SHM6
+  'Si':  { currency:'RUB', pointValue:1,                           asset:'SI'       },  // SiH7
+  'SN':  { currency:'RUB', pointValue:1,                           asset:'SNGR'     },  // SNM6
+  'SO':  { currency:'RUB', pointValue:1,                           asset:'SIBN'     },  // SOM6
+  'SP':  { currency:'RUB', pointValue:1,                           asset:'SBPR'     },  // SPH7
+  'SQ':  { currency:'USD', pointValue:75.235,    pointUsd:1,       asset:'SOXQ'     },  // SQM6
+  'SR':  { currency:'RUB', pointValue:1,                           asset:'SBRF'     },  // SRH7
+  'SS':  { currency:'RUB', pointValue:1,                           asset:'SMLT'     },  // SSM6
+  'Su':  { currency:'RUB', pointValue:0.1,                         asset:'SUGAR'    },  // SuK6
+  'SV':  { currency:'USD', pointValue:752.346,   pointUsd:10,      asset:'SILV'     },  // SVH7
+  'SX':  { currency:'RUB', pointValue:0.8873,                      asset:'STOX'     },  // SXM6
+  'SZ':  { currency:'RUB', pointValue:1,                           asset:'SGZH'     },  // SZM6
+  'TB':  { currency:'RUB', pointValue:1,                           asset:'T'        },  // TBM6
+  'TC':  { currency:'RUB', pointValue:96.208,                      asset:'TENCENT'  },  // TCM6
+  'TL':  { currency:'USD', pointValue:752.346,   pointUsd:10,      asset:'TLT'      },  // TLM6
+  'TN':  { currency:'RUB', pointValue:1,                           asset:'TRNF'     },  // TNM6
+  'TP':  { currency:'RUB', pointValue:1,                           asset:'TATP'     },  // TPM6
+  'TR':  { currency:'RUB', pointValue:1683.6,                      asset:'UTRY'     },  // TRM6
+  'TT':  { currency:'RUB', pointValue:1,                           asset:'TATN'     },  // TTM6
+  'TY':  { currency:'RUB', pointValue:1000,                        asset:'TRY'      },  // TYM6
+  'UC':  { currency:'RUB', pointValue:11089.5,                     asset:'UCNY'     },  // UCH7
+  'UN':  { currency:'RUB', pointValue:1,                           asset:'UPRO'     },  // UNM6
+  'UT':  { currency:'RUB', pointValue:164,                         asset:'UKZT'     },  // UTM6
+  'VB':  { currency:'RUB', pointValue:1,                           asset:'VTBR'     },  // VBM6
+  'VI':  { currency:'USD', pointValue:150.4692,  pointUsd:2,       asset:'RVI'      },  // VIJ6
+  'VK':  { currency:'RUB', pointValue:1,                           asset:'VKCO'     },  // VKM6
+  'WU':  { currency:'RUB', pointValue:1,                           asset:'WUSH'     },  // WUM6
+  'XI':  { currency:'RUB', pointValue:962.08,                      asset:'XIA'      },  // XIM6
+  'YD':  { currency:'RUB', pointValue:1,                           asset:'YDEX'     },  // YDM6
+  'ZC':  { currency:'RUB', pointValue:7.52346,                     asset:'ZINC'     },  // ZCM6
 };
 
 // Кэш спецификаций, полученных с МосБиржи (ISS). Ключ — префикс тикера.
@@ -882,11 +976,35 @@ const MOEX_SPEC_CACHE = {};
 let moexSpecLoaded = false;   // true после успешного запроса к ISS
 let moexSpecLoading = false;  // флаг защиты от параллельных запросов
 
-// Извлекает префикс из тикера фьючерса: "BRH5" → "BR", "SRZ4" → "SR"
-// Prefix — всё, что до кода месяца (F,G,H,J,K,M,N,Q,U,V,X,Z) и цифры года.
+// Инвертированный словарь: ASSET → prefix
+// ASSET — поле из ISS, которое АЛОР пишет в поле «Контракт» отчёта (без даты экспирации).
+// Пример: 'RTS' → 'RI', 'AFLT' → 'AF', 'GOLD' → 'GD', 'SI' → 'Si'
+// Поиск регистронезависимый — ISS хранит 'EU'/'SI' в верхнем регистре,
+// а в отчёте может встретиться 'Eu-3.27' / 'Si-3.27'.
+const ASSET_TO_PREFIX = (() => {
+  const map = {};
+  for (const [prefix, spec] of Object.entries(CONTRACT_SPECS)) {
+    if (spec.asset) map[spec.asset.toUpperCase()] = prefix;
+  }
+  return map;
+})();
+
+// Извлекает префикс из тикера фьючерса.
+// Поддерживает два формата:
+//   1. Биржевой:  'RIH7', 'BRK6', 'SiH7'   → 'RI', 'BR', 'Si'
+//   2. АЛОР/ISS:  'RTS-6.26', 'AFLT-6.26'  → 'RI', 'AF'  (через ASSET_TO_PREFIX)
 function extractPrefix(ticker) {
-  const m = ticker.match(/^([A-Za-z]+)[FGHJKMNQUVXZ]\d/);
-  return m ? m[1] : ticker;
+  // Формат биржи: буквы + код месяца [FGHJKMNQUVXZ] + цифра года
+  let m = ticker.match(/^([A-Za-z]+)[FGHJKMNQUVXZ]\d/);
+  if (m) return m[1];
+  // Формат АЛОР: ASSET-M.YY → берём часть до дефиса, ищем по ASSET (регистронезависимо)
+  m = ticker.match(/^([^-]+)-\d/);
+  if (m) {
+    const prefix = ASSET_TO_PREFIX[m[1].toUpperCase()];
+    if (prefix) return prefix;
+    return m[1]; // fallback
+  }
+  return ticker;
 }
 
 // Загружает спецификации всех активных FORTS-фьючерсов с МосБиржи ISS.
@@ -947,12 +1065,16 @@ async function loadMoexSpecs() {
     if (tickers.length === 0) { moexSpecLoaded = true; return; }
 
     // Для каждого тикера из отчёта запрашиваем спецификацию.
-    // Если тикер уже истёк — ISS его не знает, используем префикс из словаря.
+    // Если префикс уже есть во встроенном словаре — ISS не запрашиваем:
+    //   словарь содержит точные константы (pointUsd, pointValue) и актуальнее ISS.
+    // ISS запрашиваем только для неизвестных контрактов (нет в CONTRACT_SPECS).
     // Запросы параллельные — все сразу через Promise.all.
     const results = await Promise.all(tickers.map(async ticker => {
       const prefix = extractPrefix(ticker);
-      // Если префикс уже в кэше — пропускаем (несколько контрактов одного базового актива)
+      // Уже в кэше ISS — пропускаем
       if (MOEX_SPEC_CACHE[prefix]) return;
+      // Есть во встроенном словаре — не запрашиваем ISS, словарь приоритетнее
+      if (CONTRACT_SPECS[prefix]) return;
       const spec = await fetchOneMoexSpec(ticker);
       if (spec && !MOEX_SPEC_CACHE[prefix]) {
         MOEX_SPEC_CACHE[prefix] = spec;
@@ -972,18 +1094,17 @@ async function loadMoexSpecs() {
 }
 
 // Возвращает спецификацию контракта.
-// Приоритет: 1) кэш МосБиржи  2) встроенный словарь  3) дефолт RUB/1.0
+// Приоритет: 1) встроенный словарь (точные константы биржи)
+//            2) кэш МосБиржи ISS (для неизвестных/новых контрактов)
+//            3) дефолт RUB/1.0
 function getSpec(contract) {
   const prefix = extractPrefix(contract);
-  // 1. Данные с МосБиржи (свежие, наиболее точные)
-  if (MOEX_SPEC_CACHE[prefix]) return MOEX_SPEC_CACHE[prefix];
-  // 2. Встроенный словарь — сначала точное совпадение по префиксу
+  // 1. Встроенный словарь — наиболее точный источник (содержит pointUsd)
   if (CONTRACT_SPECS[prefix]) return CONTRACT_SPECS[prefix];
-  // 3. Встроенный словарь — совпадение по startsWith (для длинных ключей типа GLDRUBF)
-  for (const [pfx, spec] of Object.entries(CONTRACT_SPECS))
-    if (contract.startsWith(pfx)) return spec;
-  // 4. Дефолт
-  return { currency:'RUB', pointValue:1.0, name: contract };
+  // 2. Кэш МосБиржи ISS — для контрактов не из словаря
+  if (MOEX_SPEC_CACHE[prefix]) return MOEX_SPEC_CACHE[prefix];
+  // 3. Дефолт
+  return { currency:'RUB', pointValue:1.0 };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1740,8 +1861,10 @@ function calcPnl() {
             if (isFutures) {
               const spec = getSpec();
               const delta = shortQ[0].price - ev.price; // продали дороже → прибыль
-              gross += spec.currency === 'USD'
-                ? delta * spec.pointValue * matched * ev.usdRate
+              // pointUsd — константа биржи (USD/пункт), умножаем на курс на дату закрытия
+              // pointValue — фолбэк для рублёвых контрактов без pointUsd
+              gross += spec.pointUsd !== undefined
+                ? delta * spec.pointUsd * matched * (ev.usdRate || 1)
                 : delta * spec.pointValue * matched;
             } else {
               rSell += matched * shortQ[0].price;
@@ -1767,8 +1890,8 @@ function calcPnl() {
             if (isFutures) {
               const spec = getSpec();
               const delta = ev.price - longQ[0].price;
-              gross += spec.currency === 'USD'
-                ? delta * spec.pointValue * matched * ev.usdRate
+              gross += spec.pointUsd !== undefined
+                ? delta * spec.pointUsd * matched * (ev.usdRate || 1)
                 : delta * spec.pointValue * matched;
             } else {
               rBuy  += matched * longQ[0].price;
@@ -1968,8 +2091,8 @@ function calcQualStatus() {
   function tradeVolume(t) {
     if (t.type === 'stock') return Math.abs(t.sum) || Math.abs(t.qty * t.price);
     const spec = getSpec(t.emitter);
-    const rub = spec.currency === 'USD'
-      ? t.qty * t.price * spec.pointValue * (t.usdRate || 1)
+    const rub = spec.pointUsd !== undefined
+      ? t.qty * t.price * spec.pointUsd * (t.usdRate || 1)
       : t.qty * t.price * spec.pointValue;
     return Math.abs(rub);
   }
@@ -2724,8 +2847,8 @@ function calcTradePairs(emitter) {
           if (isFutures) {
             const s = spec;
             const delta = openEntry.price - t.price;
-            diff = s.currency === 'USD'
-              ? delta * s.pointValue * matched * (t.usdRate || 1)
+            diff = s.pointUsd !== undefined
+              ? delta * s.pointUsd * matched * (t.usdRate || 1)
               : delta * s.pointValue * matched;
           } else {
             diff = (openEntry.price - t.price) * matched;
@@ -2762,8 +2885,8 @@ function calcTradePairs(emitter) {
           if (isFutures) {
             const s = spec;
             const delta = t.price - openEntry.price;
-            diff = s.currency === 'USD'
-              ? delta * s.pointValue * matched * (t.usdRate || 1)
+            diff = s.pointUsd !== undefined
+              ? delta * s.pointUsd * matched * (t.usdRate || 1)
               : delta * s.pointValue * matched;
           } else {
             diff = (t.price - openEntry.price) * matched;
