@@ -1271,9 +1271,12 @@ function parseXML(xmlText, filename) {
       price:parseNum(r['Цена последней сделки, руб**']||r['Цена последней сделки в валюте расчетов']),
       isShort: valuation < 0 || planned < 0
     });
-    // Фиксируем входящий остаток для акций (не RUB) — используется в FIFO как унаследованная позиция
-    if (name !== 'RUB' && incoming !== 0) {
-      report.openPositions[name] = (report.openPositions[name] || 0) + incoming;
+    // Фиксируем ИСХОДЯЩИЙ остаток факт как позицию на конец дня отчёта.
+    // Он становится входящим (унаследованным) остатком для следующего отчёта.
+    // FIFO использует openPositions самого раннего отчёта как унаследованную позицию.
+    const outgoing = parseNum(r['Исходящий остаток факт']);
+    if (name !== 'RUB' && outgoing !== 0) {
+      report.openPositions[name] = outgoing;
     }
   });
 
@@ -1297,6 +1300,10 @@ function parseXML(xmlText, filename) {
     if (opLow.includes('репо') || opLow.includes('repo')) return;
     if (market.includes('репо') || market.includes('repo') || market === 'мб цк') return;
     if (note.includes('репо') || note.includes('repo')) return;
+    // Пропускаем строки НКД — в отчёте АЛОР НКД отражается отдельной строкой,
+    // где «Эмитент» содержит числовое значение НКД (не название компании-эмитента).
+    // Используем только этот признак, чтобы не задеть реальные сделки.
+    if (/^[\d\s\u00a0\u202f.,+\-]+$/.test(emitter.trim())) return;
     const qty = Math.abs(parseNum(r['Кол-во']));
     const price = parseNum(r['Цена']);
     const sum = parseNum(r['Сумма в валюте цены']);
@@ -1419,6 +1426,33 @@ function parseXML(xmlText, filename) {
       }
     });
   }
+
+  // НКД при продаже облигаций (Обязательства по ранее заключенным сделкам покупки/продажи ЦБ)
+  // Если строка содержит положительный НКД — это зачисленный накопленный купонный доход
+  // при продаже облигации. Он должен попадать в раздел «Купоны», а не в сделки.
+  (parseRows('Обязательства по ранее заключенным сделкам покупки/продажи ЦБ')||[]).forEach(r => {
+    const nkd = parseNum(r['НКД в валюте цены']);
+    if (nkd <= 0) return; // только положительный НКД (продажа облигации)
+    const emitter = r['Эмитент']||'';
+    const qty = Math.abs(parseNum(r['Кол-во']));
+    if (!emitter) return;
+    const currency = r['Валюта цены']||'RUB';
+    // Дата поставки / дата заключения
+    const dateRaw = r['Оплата план'] || r['Дата заключения'] || report.date;
+    const sortDateVal = normDate(dateRaw) || report.sortDate;
+    const noteText = `Продажа ${qty} облигаций ${emitter}`;
+    report.moneyFlows.push({
+      date: dateRaw || report.date,
+      sortDate: sortDateVal,
+      operation: 'Купон',
+      market: 'Фондовый рынок',
+      currency,
+      amount: nkd,
+      rawAmount: nkd,
+      note: noteText,
+      category: 'coupon'
+    });
+  });
 
   // Money flows (Зачисление/списание денежных средств)
   (parseRows('Зачисление/списание денежных средств')||[]).forEach(r => {
