@@ -625,6 +625,52 @@ select:hover, select:focus { border-color:var(--gold); box-shadow: 0 0 0 3px rgb
 .theme-toggle:hover { border-color: var(--gold); color: var(--text); }
 .theme-toggle svg { width:15px; height:15px; flex-shrink:0; }
 
+/* ── CHART TOOLTIP ── */
+.chart-tip {
+  display: none;
+  position: fixed;
+  z-index: 1000;
+  background: var(--bg4);
+  border: 1px solid var(--border2);
+  border-radius: 8px;
+  padding: 8px 13px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text);
+  pointer-events: none;
+  box-shadow: var(--shadow);
+  white-space: nowrap;
+  font-family: var(--sans);
+  min-width: 120px;
+}
+.chart-tip strong { display: block; font-family: var(--mono); color: var(--text2); font-size: 11px; margin-bottom: 2px; }
+.chart-tip .tip-val { font-size: 15px; font-weight: 700; font-family: var(--mono); }
+
+/* ── HEATMAP ── */
+.heatmap-wrap {
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.heatmap-grid {
+  display: inline-grid;
+  grid-template-rows: repeat(7, 16px);
+  grid-auto-flow: column;
+  gap: 3px;
+  padding: 4px 0;
+}
+.hm-cell {
+  width: 16px; height: 16px;
+  border-radius: 3px;
+  cursor: default;
+  transition: transform 0.1s;
+  position: relative;
+}
+.hm-cell:hover { transform: scale(1.4); z-index: 10; }
+.hm-empty { background: var(--bg5); opacity: 0.4; }
+.hm-legend { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text3); margin-top: 8px; flex-wrap: wrap; }
+.hm-legend-bar { display: flex; gap: 2px; align-items: center; }
+.hm-legend-bar div { width: 14px; height: 14px; border-radius: 3px; }
+
 /* Light theme tweaks */
 [data-theme="light"] .header {
   background: linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.97) 100%);
@@ -732,6 +778,9 @@ select:hover, select:focus { border-color:var(--gold); box-shadow: 0 0 0 3px rgb
   <div class="usd-rate-chip" id="usdRateChip"></div>
 </div>
 
+<!-- CHART TOOLTIP -->
+<div id="chartTip" class="chart-tip"></div>
+
 <!-- LAYOUT -->
 <div class="layout">
   <!-- NAV -->
@@ -755,7 +804,7 @@ select:hover, select:focus { border-color:var(--gold); box-shadow: 0 0 0 3px rgb
         Перенос позиций
       </button>
       <button class="nav-item" onclick="switchTab('costs')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><text x="4" y="18" font-size="16" font-family="serif" fill="currentColor" stroke="none">₽</text></svg>
         Комиссии
       </button>
       <button class="nav-item" onclick="switchTab('money')">
@@ -1208,7 +1257,7 @@ function short(s, n=16) { return s.length > n ? s.slice(0,n-1)+'…' : s; }
 function parseXML(xmlText, filename) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(xmlText, 'text/xml');
-  const report = { filename, date:'', sortDate:'', usdRate:1,
+  const report = { filename, date:'', sortDate:'', usdRate:1, cnyRate:1,
     accountNumber:'', clientName:'',
     assets:[], trades:[], repoTrades:[], futures:[], costs:[], moneyFlows:[],
     openPositions:{},  // { emitter: qty } — входящие позиции (+ лонг, - шорт)
@@ -1224,13 +1273,46 @@ function parseXML(xmlText, filename) {
   const clientEl = doc.querySelector('clientName');
   report.clientName = clientEl ? clientEl.textContent.trim() : '';
 
-  // USD rate from moneyMovements row "Курс ЦБ РФ"
-  for (const row of doc.querySelectorAll('moneyMovements row')) {
-    const cells = [...row.querySelectorAll('cell')]
-      .map(c => (c.querySelector('cellValue')||{}).textContent||'');
-    if (cells.join(' ').includes('Курс ЦБ')) {
-      const r = parseNum(cells[2]);
-      if (r > 1) { report.usdRate = r; break; }
+  // USD и CNY rate из moneyMovements ("Курс ЦБ РФ")
+  // Строка "Вид валюты" содержит названия валют по колонкам (RUB, USD, CNY, ...),
+  // строка "Курс ЦБ РФ" содержит значения в тех же позициях.
+  // Сначала находим позиции USD и CNY по заголовочной строке, затем берём числа из строки курсов.
+  {
+    const mmRows = [...doc.querySelectorAll('moneyMovements row')];
+    let currencyColMap = {}; // { 'USD': idx, 'CNY': idx }
+    for (const row of mmRows) {
+      const cells = [...row.querySelectorAll('cell')]
+        .map(c => (c.querySelector('cellValue')||{}).textContent.trim()||'');
+      const joined = cells.join(' ');
+      // Строка с названиями валют
+      if (joined.includes('USD') || joined.includes('CNY')) {
+        cells.forEach((c, i) => {
+          const cu = c.toUpperCase();
+          if (cu === 'USD') currencyColMap['USD'] = i;
+          if (cu === 'CNY') currencyColMap['CNY'] = i;
+        });
+      }
+      // Строка с курсами
+      if (joined.includes('Курс ЦБ')) {
+        if (currencyColMap['CNY'] !== undefined) {
+          const r = parseNum(cells[currencyColMap['CNY']]);
+          if (r > 0.5) report.cnyRate = r;
+        } else {
+          // Фолбэк для старых отчётов: CNY в joined (маловероятно, но на всякий случай)
+          const joinedUp = joined.toUpperCase();
+          if (joinedUp.includes('CNY') || joinedUp.includes('КИТ') || joinedUp.includes('ЮАН')) {
+            const r = parseNum(cells[2]||cells[3]||cells[1]);
+            if (r > 0.5) report.cnyRate = r;
+          }
+        }
+        if (currencyColMap['USD'] !== undefined) {
+          const r = parseNum(cells[currencyColMap['USD']]);
+          if (r > 1) report.usdRate = r;
+        } else {
+          const r = parseNum(cells[2]);
+          if (r > 1) report.usdRate = r;
+        }
+      }
     }
   }
 
@@ -1311,6 +1393,8 @@ function parseXML(xmlText, filename) {
     const clearFee = parseNum(r['Клиринговый сбор']);
     const brokerFee = parseNum(r['Вознаграждение брокера']);
     const isBuy = op.toLowerCase().includes('покупка');
+    // Валюта цены — для CNY/USD облигаций нужно конвертировать сумму в рубли
+    const priceCurrency = (r['Валюта цены']||'RUB').trim().toUpperCase();
     // Реальная дата/время сделки — поле может называться «Дата, время» или «Дата заключения»
     const rawDT = r['Дата, время'] || r['Дата заключения'] || '';
     const timeOnly = rawDT.includes(' ') ? rawDT.split(' ')[1] : (r['Время']||'');
@@ -1323,6 +1407,9 @@ function parseXML(xmlText, filename) {
       qty, price, sum, exchFee, clearFee, brokerFee,
       totalFee: Math.abs(exchFee)+Math.abs(clearFee)+Math.abs(brokerFee),
       isBuy, market:r['Биржа']||'', type:'stock',
+      priceCurrency,
+      cnyRate: report.cnyRate,
+      usdRate: report.usdRate,
       isin:(r['Номер гос. регистрации']||'').replace(/[\s\u00a0\u202f\u2009]/g,'').trim(),
       dealNum:(r['Номер сделки']||'').replace(/[\s\u00a0\u202f\u2009]/g,'').trim()
     });
@@ -2124,7 +2211,11 @@ function calcQualStatus() {
   if (!trades.length) return null;
 
   function tradeVolume(t) {
-    if (t.type === 'stock') return Math.abs(t.sum) || Math.abs(t.qty * t.price);
+    if (t.type === 'stock') {
+      const fxRate = t.priceCurrency === 'USD' ? (t.usdRate || 1)
+                   : t.priceCurrency === 'CNY' ? (t.cnyRate || 1) : 1;
+      return (Math.abs(t.sum) || Math.abs(t.qty * t.price)) * fxRate;
+    }
     const spec = getSpec(t.emitter);
     const rub = spec.pointUsd !== undefined
       ? t.qty * t.price * spec.pointUsd * (t.usdRate || 1)
@@ -3374,8 +3465,14 @@ function renderTrades() {
         <td>${t.isBuy?'<span class="badge badge-buy">Покупка</span>':'<span class="badge badge-sell">Продажа</span>'}</td>
         <td class="td-mono td-muted" style="font-size:11px">${t.market||'—'}</td>
         <td class="td-mono">${t.qty}</td>
-        <td class="td-mono">${t.price?fmt(t.price,3):'—'}</td>
-        <td class="td-mono">${t.sum?fmt(Math.abs(t.sum),2):'—'}</td>
+        <td class="td-mono">${t.price?fmt(t.price,3)+(t.priceCurrency&&t.priceCurrency!=='RUB'?` <span style="font-size:10px;color:var(--text3)">${t.priceCurrency}</span>`:''):'—'}</td>
+        <td class="td-mono">${(()=>{
+          if (!t.sum && !t.price) return '—';
+          const fxRate = t.priceCurrency==='USD' ? (t.usdRate||1) : t.priceCurrency==='CNY' ? (t.cnyRate||1) : 1;
+          const rubSum = Math.abs(t.sum||t.qty*t.price) * fxRate;
+          const suffix = t.priceCurrency&&t.priceCurrency!=='RUB' ? ` <span style="font-size:10px;color:var(--text3)">≈</span>` : '';
+          return fmt(rubSum,2)+suffix;
+        })()}</td>
         <td class="td-mono neg">${t.exchFee?fmt(Math.abs(t.exchFee),2):'—'}</td>
         <td class="td-mono neg">${t.clearFee?fmt(Math.abs(t.clearFee),2):'—'}</td>
         <td class="td-mono neg">${t.brokerFee?fmt(Math.abs(t.brokerFee),2):'—'}</td>
@@ -3598,7 +3695,7 @@ function renderCosts() {
         <td><span class="badge badge-fut">Комиссия</span></td>
         <td class="td-muted" style="font-size:11px">${f.market}</td>
         <td class="td-mono td-muted">${f.currency}</td>
-        <td class="td-mono" style="font-weight:700">−${fmt(f.amount)} ${f.currency}</td>
+        <td class="td-mono" style="font-weight:700;white-space:nowrap">−${fmt(f.amount)} ${f.currency}</td>
         <td style="font-size:12px;color:var(--text2)">${f.note||'—'}</td>
       </tr>`).join('')}</tbody>
     </table></div>` : ''}
@@ -3614,7 +3711,7 @@ function renderCosts() {
         <td><span class="badge" style="background:rgba(244,114,182,0.12);color:#f472b6;border:1px solid rgba(244,114,182,0.25)">Депозитарий</span></td>
         <td class="td-muted" style="font-size:11px">${f.market}</td>
         <td class="td-mono td-muted">${f.currency}</td>
-        <td class="td-mono" style="font-weight:700">−${fmt(f.amount,2)} ${f.currency}</td>
+        <td class="td-mono" style="font-weight:700;white-space:nowrap">−${fmt(f.amount,2)} ${f.currency}</td>
         <td style="font-size:12px;color:var(--text2)">${f.note||'—'}</td>
       </tr>`).join('')}</tbody>
     </table></div>` : ''}
@@ -3854,6 +3951,184 @@ function renderMoney() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CHART TOOLTIP ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
+const CHART_DATA = {};
+
+function showChartTip(event, chartId) {
+  const d = CHART_DATA[chartId];
+  if (!d || !d.vals.length) return;
+  const rect = event.currentTarget.getBoundingClientRect();
+  const xRel = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  const idx  = Math.round(xRel * (d.vals.length - 1));
+  const val  = d.vals[idx];
+  const label = d.labels[idx];
+  const isPos = val >= 0;
+  const sign  = d.showSign ? (isPos ? '+' : '−') : '';
+  const color = d.showSign ? (isPos ? 'var(--green)' : 'var(--red)') : 'var(--text)';
+  const tip = document.getElementById('chartTip');
+  tip.innerHTML = `<strong>${label}</strong><span class="tip-val" style="color:${color}">${sign}${fmt(Math.abs(val), 0)} ${d.suffix}</span>`;
+  tip.style.display = 'block';
+  const tx = event.clientX + 16;
+  const ty = event.clientY - 36;
+  tip.style.left = Math.min(tx, window.innerWidth - 180) + 'px';
+  tip.style.top  = Math.max(4, ty) + 'px';
+}
+
+function hideChartTip() {
+  const tip = document.getElementById('chartTip');
+  if (tip) tip.style.display = 'none';
+}
+
+function showHeatTip(event, label, val) {
+  const tip = document.getElementById('chartTip');
+  const isPos = val >= 0;
+  const sign  = isPos ? '+' : '−';
+  const color = isPos ? 'var(--green)' : 'var(--red)';
+  tip.innerHTML = `<strong>${label}</strong><span class="tip-val" style="color:${color}">${sign}${fmt(Math.abs(val), 0)} ₽</span>`;
+  tip.style.display = 'block';
+  const tx = event.clientX + 16;
+  const ty = event.clientY - 36;
+  tip.style.left = Math.min(tx, window.innerWidth - 180) + 'px';
+  tip.style.top  = Math.max(4, ty) + 'px';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CUMULATIVE P&L ПО ДНЯМ (для графика)
+// ─────────────────────────────────────────────────────────────────────────────
+function calcCumulativePnlByDay() {
+  const reps = getFilteredReports();
+  if (reps.length < 2) return [];
+  const mf = allMoneyFlows();
+  const flowByDate = {};
+  mf.forEach(f => {
+    if (f.category === 'deposit' || f.category === 'withdrawal') {
+      const d = f.sortDate || '';
+      flowByDate[d] = (flowByDate[d]||0) + (f.category==='deposit'?f.amount:-Math.abs(f.amount));
+    }
+  });
+  let cumPnl = 0;
+  const result = [];
+  for (let i = 1; i < reps.length; i++) {
+    const cur  = reps[i].assets.reduce((s,a)=>s+a.valuation,0);
+    const prev = reps[i-1].assets.reduce((s,a)=>s+a.valuation,0);
+    const flow = flowByDate[reps[i].sortDate] || 0;
+    const dayPnl = (cur - prev) - flow;
+    cumPnl += dayPnl;
+    result.push({ date: reps[i].date, sortDate: reps[i].sortDate, dayPnl, cumPnl });
+  }
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HEATMAP: P&L по дням-ячейкам
+// ─────────────────────────────────────────────────────────────────────────────
+function renderHeatmap(dayData) {
+  if (!dayData.length) return '<div style="color:var(--text3);font-size:12px">Недостаточно данных</div>';
+
+  const parseDate = s => {
+    const [d,m,y] = s.split('.');
+    return new Date(+y, +m-1, +d);
+  };
+  const first = parseDate(dayData[0].date);
+  const last  = parseDate(dayData[dayData.length-1].date);
+
+  const pnlMap = {};
+  dayData.forEach(d => {
+    const dt = parseDate(d.date);
+    const key = dt.toISOString().slice(0,10);
+    pnlMap[key] = d.dayPnl;
+  });
+
+  const maxAbs = Math.max(...dayData.map(d=>Math.abs(d.dayPnl)), 1);
+
+  function heatColor(val) {
+    if (val === undefined) return null;
+    const intensity = Math.min(1, Math.abs(val) / maxAbs);
+    if (val > 0) {
+      const g = Math.round(150 + 55*intensity);
+      const r = Math.round(30 + 30*(1-intensity));
+      return `rgb(${r},${g},100)`;
+    } else if (val < 0) {
+      const r = Math.round(150 + 90*intensity);
+      const b = Math.round(80*(1-intensity));
+      return `rgb(${r},60,${b})`;
+    }
+    return 'var(--bg5)';
+  }
+
+  const startDate = new Date(first);
+  const dow = (startDate.getDay()+6)%7;
+  startDate.setDate(startDate.getDate()-dow);
+
+  const cells = [];
+  const monthLabels = [];
+  let col = 0, prevMonth = -1;
+  const d = new Date(startDate);
+
+  while (d <= last) {
+    const weekCells = [];
+    for (let wd = 0; wd < 7; wd++) {
+      const key = d.toISOString().slice(0,10);
+      const val = pnlMap[key];
+      const inRange = d >= first && d <= last;
+      const dayLabel = d.toLocaleDateString('ru',{day:'numeric',month:'short'});
+      weekCells.push({ key, val: inRange?val:undefined, dayLabel });
+      if (wd===0 && d.getMonth()!==prevMonth && inRange) {
+        monthLabels.push({ col, label: d.toLocaleDateString('ru',{month:'short'}) });
+        prevMonth = d.getMonth();
+      }
+      d.setDate(d.getDate()+1);
+    }
+    cells.push(weekCells);
+    col++;
+  }
+
+  const DOW_LABELS = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
+
+  const cellsHtml = cells.map(week =>
+    week.map(c => {
+      const color = heatColor(c.val);
+      if (!color) return `<div class="hm-cell hm-empty"></div>`;
+      const tip = c.val !== undefined
+        ? `onmouseenter="showHeatTip(event,'${c.dayLabel}',${c.val})" onmouseleave="hideChartTip()"`
+        : '';
+      return `<div class="hm-cell" style="background:${color}" ${tip}></div>`;
+    }).join('')
+  ).join('');
+
+  const monthHtml = `<div style="display:flex;margin-bottom:4px;padding-left:28px;position:relative;height:16px">
+    ${monthLabels.map(m=>`<div style="position:absolute;left:${28+m.col*19}px;font-size:10px;font-family:var(--mono);color:var(--text3);white-space:nowrap">${m.label}</div>`).join('')}
+  </div>`;
+
+  const dowHtml = `<div style="display:inline-grid;grid-template-rows:repeat(7,16px);gap:3px;padding:4px 0;margin-right:6px;flex-shrink:0">
+    ${DOW_LABELS.map((l,i)=>`<div style="font-size:10px;font-family:var(--mono);color:var(--text3);line-height:16px;text-align:right;white-space:nowrap">${i%2===0?l:''}</div>`).join('')}
+  </div>`;
+
+  return `
+    ${monthHtml}
+    <div style="display:flex;align-items:flex-start">
+      ${dowHtml}
+      <div class="heatmap-wrap">
+        <div class="heatmap-grid">${cellsHtml}</div>
+      </div>
+    </div>
+    <div class="hm-legend">
+      Меньше
+      <div class="hm-legend-bar">
+        ${[0.15,0.35,0.55,0.75,1.0].map(v=>`<div style="background:rgb(${Math.round(30+30*(1-v))},${Math.round(150+55*v)},100)"></div>`).join('')}
+      </div>
+      Прибыль &nbsp;
+      <div class="hm-legend-bar">
+        ${[1.0,0.75,0.55,0.35,0.15].map(v=>`<div style="background:rgb(${Math.round(150+90*v)},60,${Math.round(80*(1-v))})"></div>`).join('')}
+      </div>
+      Убыток &nbsp;
+      <div style="width:14px;height:14px;border-radius:3px;background:var(--bg5);display:inline-block;vertical-align:middle"></div> Нет данных
+    </div>
+  `;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DYNAMICS
 // ─────────────────────────────────────────────────────────────────────────────
 function renderDynamics() {
@@ -3872,7 +4147,7 @@ function renderDynamics() {
   // Универсальный SVG-график — linechart или histogram
   // Архитектура: ось Y — отдельный SVG фиксированной ширины (подписи не искажаются),
   // данные + сетка — отдельный SVG с preserveAspectRatio="none" (растягивается на всю ширину)
-  function makeSvgChart({ vals, chartType, color, fillColor, gradientId, lineGradientId, legendLabel }) {
+  function makeSvgChart({ vals, chartType, color, fillColor, gradientId, lineGradientId, legendLabel, extraLabels }) {
     // Логические размеры области данных (без отступов)
     const DW = 1000, DH = 240;  // viewBox области данных
     const padT = 14, padB = 0;
@@ -3953,8 +4228,20 @@ function renderDynamics() {
       }).join('')}
     </div>`;
 
-    // SVG данных — растягивается на всю оставшуюся ширину без искажений
-    const dataSvg = `<svg viewBox="0 0 ${DW} ${DH}" preserveAspectRatio="none" style="flex:1;height:240px;display:block;min-width:0">
+    // SVG данных + регистрация данных для tooltip
+    const chartId = legendLabel.replace(/\s+/g,'_');
+    const suffix  = legendLabel.toLowerCase().includes('сделок') ? 'сделок' : '₽';
+    const showSign = legendLabel.includes('P&L');
+    const chartLabels = (extraLabels && extraLabels.length === vals.length)
+      ? extraLabels
+      : vals.map((_,i) => {
+          const idx = Math.round(i / Math.max(vals.length-1,1) * (sorted.length-1));
+          return sorted[idx] ? sorted[idx].date : '';
+        });
+    CHART_DATA[chartId] = { vals, labels: chartLabels, suffix, showSign };
+
+    const dataSvg = `<svg viewBox="0 0 ${DW} ${DH}" preserveAspectRatio="none" style="flex:1;height:240px;display:block;min-width:0;cursor:crosshair"
+      onmousemove="showChartTip(event,'${chartId}')" onmouseleave="hideChartTip()">
       <defs>
         <linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stop-color="${fillColor}" stop-opacity="0.22"/>
@@ -3963,6 +4250,7 @@ function renderDynamics() {
       </defs>
       ${gridSvg}
       ${chartContent}
+      <rect x="0" y="0" width="${DW}" height="${DH}" fill="transparent"/>
     </svg>`;
 
     // Ось X — HTML поверх области данных, позиции через % от ширины dataSvg
@@ -3997,6 +4285,7 @@ function renderDynamics() {
   function portfolioLineChart() {
     return makeSvgChart({
       vals: portfolioVals,
+      extraLabels: sorted.map(r=>r.date),
       chartType: 'line',
       color: '#3b82f6',
       fillColor: '#3b82f6',
@@ -4006,9 +4295,26 @@ function renderDynamics() {
     });
   }
 
+  function cumulativePnlChart() {
+    const cumPnlData = calcCumulativePnlByDay();
+    if (cumPnlData.length < 2) return '<div style="color:var(--text3);font-size:12px;padding:8px 0">Недостаточно данных</div>';
+    const vals = cumPnlData.map(d=>d.cumPnl);
+    return makeSvgChart({
+      vals,
+      extraLabels: cumPnlData.map(d=>d.date),
+      chartType: 'line',
+      color: vals[vals.length-1] >= 0 ? 'var(--green)' : 'var(--red)',
+      fillColor: vals[vals.length-1] >= 0 ? '#34d399' : '#f87171',
+      gradientId: 'cumPnlFill',
+      lineGradientId: 'cumPnlLine',
+      legendLabel: 'Накопленный P&L (без пополнений/выводов)'
+    });
+  }
+
   function activityChart() {
     return makeSvgChart({
       vals: tradeCounts,
+      extraLabels: sorted.map(r=>r.date),
       chartType: 'histogram',
       color: 'var(--purple)',
       fillColor: 'var(--purple)',
@@ -4018,6 +4324,7 @@ function renderDynamics() {
     });
   }
 
+  const heatmapData = calcCumulativePnlByDay();
   const summaryId = 'dyn-summary-' + Date.now();
 
   document.getElementById('panel-dynamics').innerHTML = `
@@ -4026,7 +4333,13 @@ function renderDynamics() {
     <div class="section-title">Оценка портфеля по дням</div>
     <div class="block" style="padding:20px 20px 16px">${portfolioLineChart()}</div>
 
-    <div class="section-title" style="margin-top:24px">Активность — сделки по дням</div>
+    <div class="section-title" style="margin-top:24px">Накопленный P&L портфеля <span style="font-size:11px;color:var(--text3);font-family:var(--mono);text-transform:none;letter-spacing:0;margin-left:8px">изменение стоимости за вычетом пополнений и выводов</span></div>
+    <div class="block" style="padding:20px 20px 16px">${cumulativePnlChart()}</div>
+
+    <div class="section-title" style="margin-top:24px">Тепловая карта P&L по дням</div>
+    <div class="block" style="padding:18px 20px 14px">${renderHeatmap(heatmapData)}</div>
+
+    <div class="section-title" style="margin-top:24px">Активность — количество сделок по дням</div>
     <div class="block" style="padding:20px 20px 16px">${activityChart()}</div>
 
     <div class="section-title" style="margin-top:24px;cursor:pointer;user-select:none" onclick="(function(){var b=document.getElementById('${summaryId}');var a=document.getElementById('${summaryId}-arrow');if(b.style.display==='none'){b.style.display='';a.style.transform='rotate(0deg)'}else{b.style.display='none';a.style.transform='rotate(-90deg)'}})()">
